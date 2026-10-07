@@ -52,6 +52,12 @@ func (err *PartialDeleteError) Unwrap() error { return err.Cause }
 
 // DeletePrefix deletes eligible entries under prefix and verifies none remain.
 func DeletePrefix(ctx context.Context, client ObjectDeleter, bucket, prefix string, versioning Versioning, exclusions []string) (DeleteSummary, error) {
+	return DeletePrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, nil)
+}
+
+// DeletePrefixWithProgress deletes one prefix and reports its pre-deletion
+// inventory and each batch S3 confirms.
+func DeletePrefixWithProgress(ctx context.Context, client ObjectDeleter, bucket, prefix string, versioning Versioning, exclusions []string, progress ProgressObserver) (DeleteSummary, error) {
 	if err := ctx.Err(); err != nil {
 		return DeleteSummary{}, &PartialDeleteError{Cause: err}
 	}
@@ -59,6 +65,51 @@ func DeletePrefix(ctx context.Context, client ObjectDeleter, bucket, prefix stri
 	if err != nil {
 		return DeleteSummary{}, err
 	}
+	if progress != nil {
+		progress.Start(ctx, ProgressTotal{Objects: len(inventory.Entries), Bytes: inventory.Bytes})
+		defer progress.Finish()
+	}
+
+	return deleteInventory(ctx, client, bucket, prefix, inventory, versioning, exclusions, progress)
+}
+
+// DeleteSelectedPrefixes inventories all selected prefixes before deletion,
+// then reports a single progress stream across the selected work.
+func DeleteSelectedPrefixes(ctx context.Context, client ObjectDeleter, bucket string, prefixes []string, versioning Versioning, exclusions []string, progress ProgressObserver) (DeleteSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return DeleteSummary{}, &PartialDeleteError{Cause: err}
+	}
+	inventories := make([]Inventory, len(prefixes))
+	total := ProgressTotal{}
+	for index, prefix := range prefixes {
+		inventory, err := InventoryPrefix(ctx, client, bucket, prefix, versioning, exclusions)
+		if err != nil {
+			return DeleteSummary{}, err
+		}
+		inventories[index] = inventory
+		total.Objects += len(inventory.Entries)
+		total.Bytes += inventory.Bytes
+	}
+	if progress != nil {
+		progress.Start(ctx, total)
+		defer progress.Finish()
+	}
+
+	summary := DeleteSummary{}
+	for index, prefix := range prefixes {
+		deleted, err := deleteInventory(ctx, client, bucket, prefix, inventories[index], versioning, exclusions, progress)
+		summary.Deleted += deleted.Deleted
+		summary.DeletedBytes += deleted.DeletedBytes
+		summary.Failures = append(summary.Failures, deleted.Failures...)
+		if err != nil {
+			return summary, err
+		}
+	}
+
+	return summary, nil
+}
+
+func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix string, inventory Inventory, versioning Versioning, exclusions []string, progress ProgressObserver) (DeleteSummary, error) {
 
 	summary := DeleteSummary{}
 	for start := 0; start < len(inventory.Entries); start += deleteBatchSize {
@@ -69,8 +120,12 @@ func DeletePrefix(ctx context.Context, client ObjectDeleter, bucket, prefix stri
 		if end > len(inventory.Entries) {
 			end = len(inventory.Entries)
 		}
+		before := summary
 		if err := deleteBatch(ctx, client, bucket, inventory.Entries[start:end], versioning, &summary); err != nil {
 			return summary, &PartialDeleteError{Summary: summary, Cause: err}
+		}
+		if progress != nil {
+			progress.Advance(ProgressTotal{Objects: summary.Deleted - before.Deleted, Bytes: summary.DeletedBytes - before.DeletedBytes})
 		}
 	}
 
