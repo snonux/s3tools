@@ -31,17 +31,40 @@ type Inventory struct {
 	Bytes   int64
 }
 
+// InventoryProgress reports completed listing pages and eligible objects.
+type InventoryProgress struct {
+	Pages   int
+	Objects int
+	Bytes   int64
+}
+
+// DiscoveryProgress reports completed pages and unique top-level prefixes.
+type DiscoveryProgress struct {
+	Pages    int
+	Prefixes int
+}
+
 // DiscoverPrefixes lists every top-level directory prefix in bucket.
 func DiscoverPrefixes(ctx context.Context, client ObjectLister, bucket string, versioning Versioning, exclusions []string) ([]string, error) {
+	return DiscoverPrefixesWithProgress(ctx, client, bucket, versioning, exclusions, nil)
+}
+
+// DiscoverPrefixesWithProgress lists prefixes and reports each completed page.
+func DiscoverPrefixesWithProgress(ctx context.Context, client ObjectLister, bucket string, versioning Versioning, exclusions []string, onPage func(DiscoveryProgress)) ([]string, error) {
 	if versioning == Versioned {
-		return discoverVersionedPrefixes(ctx, client, bucket, exclusions)
+		return discoverVersionedPrefixes(ctx, client, bucket, exclusions, onPage)
 	}
 
-	return discoverUnversionedPrefixes(ctx, client, bucket, exclusions)
+	return discoverUnversionedPrefixes(ctx, client, bucket, exclusions, onPage)
 }
 
 // InventoryPrefix lists deletion units under prefix, excluding protected keys.
 func InventoryPrefix(ctx context.Context, client ObjectLister, bucket, prefix string, versioning Versioning, exclusions []string) (Inventory, error) {
+	return InventoryPrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, nil)
+}
+
+// InventoryPrefixWithProgress inventories a prefix and reports each completed page.
+func InventoryPrefixWithProgress(ctx context.Context, client ObjectLister, bucket, prefix string, versioning Versioning, exclusions []string, onPage func(InventoryProgress)) (Inventory, error) {
 	if err := validatePrefix(prefix); err != nil {
 		return Inventory{}, err
 	}
@@ -49,10 +72,10 @@ func InventoryPrefix(ctx context.Context, client ObjectLister, bucket, prefix st
 		return Inventory{}, fmt.Errorf("prefix %q is protected by an exclusion", prefix)
 	}
 	if versioning == Versioned {
-		return inventoryVersions(ctx, client, bucket, prefix, exclusions)
+		return inventoryVersions(ctx, client, bucket, prefix, exclusions, onPage)
 	}
 
-	return inventoryObjects(ctx, client, bucket, prefix, exclusions)
+	return inventoryObjects(ctx, client, bucket, prefix, exclusions, onPage)
 }
 
 // IsExcluded reports whether key matches an exact-key or subtree protection rule.
@@ -69,8 +92,9 @@ func IsExcluded(key string, exclusions []string) bool {
 	return false
 }
 
-func discoverVersionedPrefixes(ctx context.Context, client ObjectLister, bucket string, exclusions []string) ([]string, error) {
+func discoverVersionedPrefixes(ctx context.Context, client ObjectLister, bucket string, exclusions []string, onPage func(DiscoveryProgress)) ([]string, error) {
 	prefixes := make(map[string]struct{})
+	pages := 0
 	var keyMarker, versionMarker *string
 	for {
 		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), Delimiter: aws.String("/"), EncodingType: types.EncodingTypeUrl, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
@@ -95,6 +119,10 @@ func discoverVersionedPrefixes(ctx context.Context, client ObjectLister, bucket 
 		for _, item := range result.DeleteMarkers {
 			addDirectoryMarker(prefixes, aws.ToString(item.Key), exclusions)
 		}
+		pages++
+		if onPage != nil {
+			onPage(DiscoveryProgress{Pages: pages, Prefixes: len(prefixes)})
+		}
 		if !aws.ToBool(result.IsTruncated) {
 			return sortedPrefixes(prefixes), nil
 		}
@@ -105,8 +133,9 @@ func discoverVersionedPrefixes(ctx context.Context, client ObjectLister, bucket 
 	}
 }
 
-func discoverUnversionedPrefixes(ctx context.Context, client ObjectLister, bucket string, exclusions []string) ([]string, error) {
+func discoverUnversionedPrefixes(ctx context.Context, client ObjectLister, bucket string, exclusions []string, onPage func(DiscoveryProgress)) ([]string, error) {
 	prefixes := make(map[string]struct{})
+	pages := 0
 	var continuationToken *string
 	for {
 		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Delimiter: aws.String("/"), EncodingType: types.EncodingTypeUrl, ContinuationToken: continuationToken})
@@ -128,6 +157,10 @@ func discoverUnversionedPrefixes(ctx context.Context, client ObjectLister, bucke
 		for _, item := range result.Contents {
 			addDirectoryMarker(prefixes, aws.ToString(item.Key), exclusions)
 		}
+		pages++
+		if onPage != nil {
+			onPage(DiscoveryProgress{Pages: pages, Prefixes: len(prefixes)})
+		}
 		if !aws.ToBool(result.IsTruncated) {
 			return sortedPrefixes(prefixes), nil
 		}
@@ -138,8 +171,9 @@ func discoverUnversionedPrefixes(ctx context.Context, client ObjectLister, bucke
 	}
 }
 
-func inventoryVersions(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string) (Inventory, error) {
+func inventoryVersions(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string, onPage func(InventoryProgress)) (Inventory, error) {
 	inventory := Inventory{}
+	pages := 0
 	var keyMarker, versionMarker *string
 	for {
 		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
@@ -164,6 +198,10 @@ func inventoryVersions(ctx context.Context, client ObjectLister, bucket, prefix 
 				addEntry(&inventory, ObjectEntry{Key: key, VersionID: aws.ToString(marker.VersionId), DeleteMarker: true})
 			}
 		}
+		pages++
+		if onPage != nil {
+			onPage(InventoryProgress{Pages: pages, Objects: len(inventory.Entries), Bytes: inventory.Bytes})
+		}
 		if !aws.ToBool(result.IsTruncated) {
 			return inventory, nil
 		}
@@ -174,8 +212,9 @@ func inventoryVersions(ctx context.Context, client ObjectLister, bucket, prefix 
 	}
 }
 
-func inventoryObjects(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string) (Inventory, error) {
+func inventoryObjects(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string, onPage func(InventoryProgress)) (Inventory, error) {
 	inventory := Inventory{}
+	pages := 0
 	var continuationToken *string
 	for {
 		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl, ContinuationToken: continuationToken})
@@ -193,6 +232,10 @@ func inventoryObjects(ctx context.Context, client ObjectLister, bucket, prefix s
 			if !IsExcluded(key, exclusions) {
 				addEntry(&inventory, ObjectEntry{Key: key, Size: aws.ToInt64(object.Size)})
 			}
+		}
+		pages++
+		if onPage != nil {
+			onPage(InventoryProgress{Pages: pages, Objects: len(inventory.Entries), Bytes: inventory.Bytes})
 		}
 		if !aws.ToBool(result.IsTruncated) {
 			return inventory, nil

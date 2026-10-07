@@ -65,6 +65,50 @@ func TestDiscoverPrefixes(t *testing.T) {
 	}
 }
 
+func TestDiscoverPrefixesReportsCompletedPages(t *testing.T) {
+	tests := []struct {
+		name       string
+		versioning Versioning
+		client     *fakeObjectLister
+	}{
+		{
+			name:       "unversioned",
+			versioning: Unversioned,
+			client: &fakeObjectLister{objectPages: []*s3.ListObjectsV2Output{
+				{IsTruncated: aws.Bool(true), NextContinuationToken: aws.String("next"), CommonPrefixes: []types.CommonPrefix{{Prefix: aws.String("a/")}, {Prefix: aws.String("keep/")}}},
+				{CommonPrefixes: []types.CommonPrefix{{Prefix: aws.String("b/")}, {Prefix: aws.String("a/")}}},
+			}},
+		},
+		{
+			name:       "versioned",
+			versioning: Versioned,
+			client: &fakeObjectLister{versionPages: []*s3.ListObjectVersionsOutput{
+				{IsTruncated: aws.Bool(true), NextKeyMarker: aws.String("a/"), NextVersionIdMarker: aws.String("v1"), CommonPrefixes: []types.CommonPrefix{{Prefix: aws.String("a/")}, {Prefix: aws.String("keep/")}}},
+				{CommonPrefixes: []types.CommonPrefix{{Prefix: aws.String("b/")}, {Prefix: aws.String("a/")}}},
+			}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var updates []DiscoveryProgress
+			prefixes, err := DiscoverPrefixesWithProgress(context.Background(), test.client, "bucket", test.versioning, []string{"keep/"}, func(progress DiscoveryProgress) {
+				updates = append(updates, progress)
+			})
+			if err != nil || !reflect.DeepEqual(prefixes, []string{"a/", "b/"}) || !reflect.DeepEqual(updates, []DiscoveryProgress{{Pages: 1, Prefixes: 1}, {Pages: 2, Prefixes: 2}}) {
+				t.Fatalf("prefixes = %#v, updates = %#v, error = %v", prefixes, updates, err)
+			}
+		})
+	}
+
+	client := &fakeObjectLister{objectErr: errors.New("denied")}
+	var updates []DiscoveryProgress
+	if _, err := DiscoverPrefixesWithProgress(context.Background(), client, "bucket", Unversioned, nil, func(progress DiscoveryProgress) {
+		updates = append(updates, progress)
+	}); err == nil || len(updates) != 0 {
+		t.Fatalf("error = %v, updates = %#v", err, updates)
+	}
+}
+
 func TestInventoryPrefix(t *testing.T) {
 	client := &fakeObjectLister{versionPages: []*s3.ListObjectVersionsOutput{
 		{IsTruncated: aws.Bool(true), NextKeyMarker: aws.String("p/a"), NextVersionIdMarker: aws.String("v1"), Versions: []types.ObjectVersion{{Key: aws.String("p/a"), VersionId: aws.String("1"), Size: aws.Int64(3)}, {Key: aws.String("p/keep/a"), VersionId: aws.String("2"), Size: aws.Int64(9)}}, DeleteMarkers: []types.DeleteMarkerEntry{{Key: aws.String("p/dead"), VersionId: aws.String("3")}}},
@@ -76,6 +120,31 @@ func TestInventoryPrefix(t *testing.T) {
 	}
 	if inventory.Bytes != 3 || len(inventory.Entries) != 2 || !inventory.Entries[1].DeleteMarker {
 		t.Fatalf("inventory = %#v", inventory)
+	}
+}
+
+func TestInventoryPrefixReportsCompletedPagesAndStopsOnError(t *testing.T) {
+	client := &fakeObjectLister{objectPages: []*s3.ListObjectsV2Output{
+		{IsTruncated: aws.Bool(true), NextContinuationToken: aws.String("next"), Contents: []types.Object{{Key: aws.String("p/a"), Size: aws.Int64(3)}, {Key: aws.String("p/keep/b"), Size: aws.Int64(9)}}},
+		{Contents: []types.Object{{Key: aws.String("p/c"), Size: aws.Int64(5)}}},
+	}}
+	var updates []InventoryProgress
+	inventory, err := InventoryPrefixWithProgress(context.Background(), client, "bucket", "p/", Unversioned, []string{"p/keep/"}, func(progress InventoryProgress) {
+		updates = append(updates, progress)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(updates, []InventoryProgress{{Pages: 1, Objects: 1, Bytes: 3}, {Pages: 2, Objects: 2, Bytes: 8}}) || len(inventory.Entries) != 2 {
+		t.Fatalf("updates = %#v, inventory = %#v", updates, inventory)
+	}
+
+	updates = nil
+	client = &fakeObjectLister{objectErr: errors.New("denied")}
+	if _, err := InventoryPrefixWithProgress(context.Background(), client, "bucket", "p/", Unversioned, nil, func(progress InventoryProgress) {
+		updates = append(updates, progress)
+	}); err == nil || len(updates) != 0 {
+		t.Fatalf("error = %v, updates = %#v", err, updates)
 	}
 }
 

@@ -172,7 +172,7 @@ func TestFormatProgress(t *testing.T) {
 		Rate:      ProgressRate{Objects: 2, Bytes: 256},
 	}
 	got := formatProgress(snapshot)
-	want := "deleted 4/10 objects (512 B/1.0 KiB); remaining 6 objects (512 B); rate 2 objects/s (256 B/s); elapsed 00:00:04; ETA 00:00:03"
+	want := "deleted 4/10 objects (512 B/1.0 KiB); remaining 6 objects (512 B); rate 2 objects/s (256 B/s); elapsed 00:00:04; ETA 00:00:03; progress [####........] 40%"
 	if got != want {
 		t.Fatalf("formatProgress() = %q, want %q", got, want)
 	}
@@ -292,8 +292,8 @@ func TestProgressRendererTerminalAndLogOutput(t *testing.T) {
 		terminal bool
 		want     string
 	}{
-		{name: "terminal", terminal: true, want: "\rdeleted 1/1 objects (1 B/1 B); remaining 0 objects (0 B); rate 0 objects/s (0 B/s); elapsed 00:00:00; ETA 00:00:00\033[K\n"},
-		{name: "log", want: "2026-10-07T09:00:00Z deleted 1/1 objects (1 B/1 B); remaining 0 objects (0 B); rate 0 objects/s (0 B/s); elapsed 00:00:00; ETA 00:00:00\n"},
+		{name: "terminal", terminal: true, want: "\rdeleted 1/1 objects (1 B/1 B); remaining 0 objects (0 B); rate 0 objects/s (0 B/s); elapsed 00:00:00; ETA 00:00:00; progress [############] 100%\033[K\n"},
+		{name: "log", want: "2026-10-07T09:00:00Z deleted 1/1 objects (1 B/1 B); remaining 0 objects (0 B); rate 0 objects/s (0 B/s); elapsed 00:00:00; ETA 00:00:00; progress [############] 100%\n"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -340,4 +340,103 @@ func TestProgressRendererFinishBeforeStart(t *testing.T) {
 	renderer.Finish()
 	renderer.Start(context.Background(), ProgressTotal{Objects: 1})
 	renderer.Finish()
+}
+
+type channelProgressWriter struct {
+	lines chan string
+}
+
+func (writer channelProgressWriter) Write(data []byte) (int, error) {
+	writer.lines <- string(data)
+	return len(data), nil
+}
+
+func TestProgressRendererReportsWhileTotalsPending(t *testing.T) {
+	output := channelProgressWriter{lines: make(chan string, 256)}
+	renderer := NewProgressRenderer(output, false)
+	renderer.interval = 20 * time.Millisecond
+	renderer.SetPhase("discovering prefixes")
+	renderer.Begin(context.Background())
+	renderer.Begin(context.Background())
+	defer renderer.Finish()
+
+	initial := readProgressLine(t, output.lines)
+	if !strings.Contains(initial, "status: discovering prefixes; total pending") {
+		t.Fatalf("initial status = %q", initial)
+	}
+	periodic := readProgressLine(t, output.lines)
+	if !strings.Contains(periodic, "status: discovering prefixes; total pending") {
+		t.Fatalf("periodic status = %q", periodic)
+	}
+	renderer.SetPhase("inventorying prefix 1/2")
+	_ = readProgressContaining(t, output.lines, "status: inventorying prefix 1/2; total pending")
+	renderer.SetPhaseQuiet("inventorying prefix 2/2")
+	_ = readProgressContaining(t, output.lines, "status: inventorying prefix 2/2; total pending")
+}
+
+func TestProgressRendererTransitionsToDeletion(t *testing.T) {
+	output := channelProgressWriter{lines: make(chan string, 256)}
+	renderer := NewProgressRenderer(output, false)
+	renderer.interval = 20 * time.Millisecond
+	renderer.SetPhase("inventorying")
+	renderer.Begin(context.Background())
+	_ = readProgressLine(t, output.lines)
+	renderer.Start(context.Background(), ProgressTotal{Objects: 2, Bytes: 20})
+	renderer.SetPhase("deleting batch")
+	line := readProgressContaining(t, output.lines, "status: deleting batch; deleted 0/2 objects")
+	if !strings.Contains(line, "status: deleting batch; deleted 0/2 objects") || !strings.Contains(line, "progress [............] 0%") {
+		t.Fatalf("deletion status = %q", line)
+	}
+	renderer.Advance(ProgressTotal{Objects: 1, Bytes: 10})
+	renderer.Finish()
+	final := readProgressContaining(t, output.lines, "deleted 1/2 objects")
+	if !strings.Contains(final, "deleted 1/2 objects") || !strings.Contains(final, "progress [######......] 50%") {
+		t.Fatalf("final status = %q", final)
+	}
+}
+
+func TestProgressRendererFinishBeforeTotals(t *testing.T) {
+	output := channelProgressWriter{lines: make(chan string, 256)}
+	renderer := NewProgressRenderer(output, false)
+	renderer.interval = 20 * time.Millisecond
+	renderer.SetPhase("checking versioning")
+	renderer.Begin(context.Background())
+	_ = readProgressLine(t, output.lines)
+	renderer.Finish()
+	final := readProgressLine(t, output.lines)
+	if !strings.Contains(final, "status: checking versioning; total pending") {
+		t.Fatalf("final status = %q", final)
+	}
+	select {
+	case line := <-output.lines:
+		t.Fatalf("status after Finish = %q", line)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func readProgressLine(t *testing.T, lines <-chan string) string {
+	t.Helper()
+	select {
+	case line := <-lines:
+		return line
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for progress")
+		return ""
+	}
+}
+
+func readProgressContaining(t *testing.T, lines <-chan string, want string) string {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case line := <-lines:
+			if strings.Contains(line, want) {
+				return line
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for progress containing %q", want)
+			return ""
+		}
+	}
 }

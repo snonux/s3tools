@@ -39,6 +39,11 @@ func DefaultBucketStatsOptions() BucketStatsOptions {
 
 // ScanBucketStats counts bucket contents until the listing completes or a configured limit is reached.
 func ScanBucketStats(ctx context.Context, client ObjectLister, bucket string, versioning Versioning, options BucketStatsOptions) (BucketStats, error) {
+	return ScanBucketStatsWithProgress(ctx, client, bucket, versioning, options, nil)
+}
+
+// ScanBucketStatsWithProgress reports each completed page of a bucket scan.
+func ScanBucketStatsWithProgress(ctx context.Context, client ObjectLister, bucket string, versioning Versioning, options BucketStatsOptions, onPage func(BucketStats)) (BucketStats, error) {
 	options, err := normalizeBucketStatsOptions(options)
 	if err != nil {
 		return BucketStats{}, err
@@ -46,9 +51,9 @@ func ScanBucketStats(ctx context.Context, client ObjectLister, bucket string, ve
 	ctx, cancel := context.WithTimeout(ctx, options.Timeout)
 	defer cancel()
 	if versioning == Versioned {
-		return scanVersionedBucketStats(ctx, client, bucket, options.MaxPages)
+		return scanVersionedBucketStats(ctx, client, bucket, options.MaxPages, onPage)
 	}
-	return scanUnversionedBucketStats(ctx, client, bucket, options.MaxPages)
+	return scanUnversionedBucketStats(ctx, client, bucket, options.MaxPages, onPage)
 }
 
 func normalizeBucketStatsOptions(options BucketStatsOptions) (BucketStatsOptions, error) {
@@ -68,7 +73,7 @@ func normalizeBucketStatsOptions(options BucketStatsOptions) (BucketStatsOptions
 	return options, nil
 }
 
-func scanUnversionedBucketStats(ctx context.Context, client ObjectLister, bucket string, maxPages int) (BucketStats, error) {
+func scanUnversionedBucketStats(ctx context.Context, client ObjectLister, bucket string, maxPages int, onPage func(BucketStats)) (BucketStats, error) {
 	stats := BucketStats{}
 	var continuationToken *string
 	for {
@@ -96,6 +101,9 @@ func scanUnversionedBucketStats(ctx context.Context, client ObjectLister, bucket
 			stats.Objects++
 			stats.Bytes += aws.ToInt64(object.Size)
 		}
+		if onPage != nil {
+			onPage(stats)
+		}
 		if !aws.ToBool(result.IsTruncated) {
 			stats.Complete = true
 			stats.SnapshotAt = time.Now()
@@ -108,7 +116,7 @@ func scanUnversionedBucketStats(ctx context.Context, client ObjectLister, bucket
 	}
 }
 
-func scanVersionedBucketStats(ctx context.Context, client ObjectLister, bucket string, maxPages int) (BucketStats, error) {
+func scanVersionedBucketStats(ctx context.Context, client ObjectLister, bucket string, maxPages int, onPage func(BucketStats)) (BucketStats, error) {
 	stats := BucketStats{}
 	var keyMarker, versionMarker *string
 	for {
@@ -137,6 +145,9 @@ func scanVersionedBucketStats(ctx context.Context, client ObjectLister, bucket s
 			stats.Bytes += aws.ToInt64(object.Size)
 		}
 		stats.Objects += int64(len(result.DeleteMarkers))
+		if onPage != nil {
+			onPage(stats)
+		}
 		if !aws.ToBool(result.IsTruncated) {
 			stats.Complete = true
 			stats.SnapshotAt = time.Now()

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParsePrefixSelection(t *testing.T) {
@@ -187,6 +188,27 @@ func TestReportBucketStatsReportsOnceAndKeepsSnapshot(t *testing.T) {
 	if stats == nil || !stats.Complete || stats.Objects != 2 || stats.Bytes != 3 {
 		t.Fatalf("cached stats = %#v", stats)
 	}
+}
+
+func TestBucketStatsScanUpdatesWaitingStatus(t *testing.T) {
+	output := channelProgressWriter{lines: make(chan string, 16)}
+	renderer := NewProgressRenderer(output, false)
+	renderer.interval = 20 * time.Millisecond
+	scan := &bucketStatsScan{}
+	scan.updateProgress(BucketStats{Pages: 1, Objects: 2, Bytes: 5})
+	scan.attachRenderer(renderer)
+	renderer.Begin(context.Background())
+	initial := readProgressLine(t, output.lines)
+	if !strings.Contains(initial, "1 pages, 2 objects (5 B) counted") {
+		t.Fatalf("initial status = %q", initial)
+	}
+	scan.updateProgress(BucketStats{Pages: 2, Objects: 4, Bytes: 9})
+	updated := readProgressContaining(t, output.lines, "2 pages, 4 objects (9 B) counted")
+	if !strings.Contains(updated, "total pending") {
+		t.Fatalf("updated status = %q", updated)
+	}
+	scan.detachRenderer()
+	renderer.Finish()
 }
 
 func TestReportBucketStatsEscapesScanError(t *testing.T) {

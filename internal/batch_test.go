@@ -3,6 +3,7 @@ package internal
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,25 @@ import (
 
 type batchClient struct {
 	fakeDeleter
+}
+
+type blockingDiscoveryClient struct {
+	batchClient
+	release chan struct{}
+	calls   int
+}
+
+func (client *blockingDiscoveryClient) ListObjectsV2(ctx context.Context, _ *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	client.calls++
+	if client.calls == 1 {
+		return &s3.ListObjectsV2Output{IsTruncated: aws.Bool(true), NextContinuationToken: aws.String("next"), CommonPrefixes: []types.CommonPrefix{{Prefix: aws.String("images/")}}}, nil
+	}
+	select {
+	case <-client.release:
+		return nil, errors.New("discovery stopped")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (client *batchClient) GetBucketVersioning(context.Context, *s3.GetBucketVersioningInput, ...func(*s3.Options)) (*s3.GetBucketVersioningOutput, error) {
@@ -156,9 +176,73 @@ func TestRunBatchUsesCompleteBucketStatsBaseline(t *testing.T) {
 	if len(client.objectPages) != 0 || len(client.deleteInputs) != 1 {
 		t.Fatalf("remaining list pages = %d, delete calls = %d", len(client.objectPages), len(client.deleteInputs))
 	}
-	if !strings.Contains(output.String(), "bucket remainder estimate from snapshot") || !strings.Contains(output.String(), "2 objects (8 B)") {
+	if !strings.Contains(output.String(), "bucket remainder estimate from snapshot") || !strings.Contains(output.String(), "2 objects (8 B)") || !strings.Contains(output.String(), "status: deletion complete") {
 		t.Fatalf("progress output = %q, want a decremented bucket remainder estimate", output.String())
 	}
+}
+
+func TestRunBatchReportsStatusWhileClientSetupIsBlocked(t *testing.T) {
+	setTestConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	output := channelProgressWriter{lines: make(chan string, 16)}
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithOutput(ctx, []string{"--prefix=images/", "--confirm-bucket=photos"}, false, false, func(ctx context.Context, _ Config) (S3API, error) {
+			select {
+			case <-release:
+				return nil, errors.New("connection failed")
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}, output)
+	}()
+	line := readProgressContaining(t, output.lines, "status: connecting to bucket; total pending")
+	if !strings.Contains(line, "elapsed") {
+		t.Fatalf("setup status = %q", line)
+	}
+	close(release)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "connection failed") {
+		t.Fatalf("run error = %v", err)
+	}
+	if line := readProgressContaining(t, output.lines, "status: operation stopped"); !strings.Contains(line, "total pending") {
+		t.Fatalf("stopped status = %q", line)
+	}
+}
+
+func TestRunBatchReportsDiscoveryPagesWhileNextPageIsBlocked(t *testing.T) {
+	setTestConfig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	output := channelProgressWriter{lines: make(chan string, 16)}
+	client := &blockingDiscoveryClient{release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithOutput(ctx, []string{"--prefix=images/", "--confirm-bucket=photos"}, false, false, func(context.Context, Config) (S3API, error) {
+			return client, nil
+		}, output)
+	}()
+	var line string
+	deadline := time.After(4 * time.Second)
+	for line == "" {
+		select {
+		case reported := <-output.lines:
+			if strings.Contains(reported, "discovering top-level prefixes: 1 pages, 1 prefixes found") {
+				line = reported
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for periodic discovery status")
+		}
+	}
+	if !strings.Contains(line, "total pending") {
+		t.Fatalf("discovery status = %q", line)
+	}
+	close(client.release)
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "discovery stopped") {
+		t.Fatalf("run error = %v", err)
+	}
+	_ = readProgressContaining(t, output.lines, "status: operation stopped")
 }
 
 func setTestConfig(t *testing.T) {

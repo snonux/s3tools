@@ -59,9 +59,11 @@ func ConfirmBucket(text, bucket string) error {
 	return nil
 }
 
-func runInteractive(ctx context.Context, input io.Reader, output io.Writer, config Config, client S3API, bucketStats bool, bucketStatsOptions BucketStatsOptions) error {
+func runInteractive(ctx context.Context, input io.Reader, output io.Writer, config Config, client S3API, bucketStats bool, bucketStatsOptions BucketStatsOptions, status *ProgressRenderer) error {
+	status.SetPhase("checking bucket versioning")
 	versioning, err := DetectVersioning(ctx, client, config.Bucket)
 	if err != nil {
+		status.SetPhase("operation stopped")
 		return err
 	}
 	var scan *bucketStatsScan
@@ -71,10 +73,15 @@ func runInteractive(ctx context.Context, input io.Reader, output io.Writer, conf
 	}
 	// Discover without exclusions so protected prefixes stay visible, then mark
 	// them unselectable before accepting input.
-	prefixes, err := DiscoverPrefixes(ctx, client, config.Bucket, versioning, nil)
+	status.SetPhase("discovering top-level prefixes")
+	prefixes, err := DiscoverPrefixesWithProgress(ctx, client, config.Bucket, versioning, nil, func(page DiscoveryProgress) {
+		status.SetPhaseQuiet(fmt.Sprintf("discovering top-level prefixes: %d pages, %d prefixes found", page.Pages, page.Prefixes))
+	})
 	if err != nil {
+		status.SetPhase("operation stopped")
 		return err
 	}
+	status.Finish()
 	reader := bufio.NewReader(input)
 	selected, err := selectPrefixesWithStats(reader, output, prefixChoices(prefixes, config.Exclude), scan)
 	if err != nil {
@@ -84,10 +91,22 @@ func runInteractive(ctx context.Context, input io.Reader, output io.Writer, conf
 	if err := confirmBucket(reader, output, config.Bucket, selected); err != nil {
 		return err
 	}
-	stats := bucketStatsScanResult(ctx, scan)
-	reportBucketStats(output, scan)
+	var stats *BucketStats
+	if scan != nil {
+		waiting := NewProgressRenderer(output, true)
+		scan.attachRenderer(waiting)
+		waiting.Begin(ctx)
+		stats = bucketStatsScanResult(ctx, scan)
+		scan.detachRenderer()
+		waiting.Finish()
+		reportBucketStats(output, scan)
+	}
 	progress := NewProgressRendererWithBucketStats(output, true, stats)
+	progress.SetPhase("preparing selected deletion")
+	progress.Begin(ctx)
+	defer progress.Finish()
 	if _, err := DeleteSelectedPrefixes(ctx, client, config.Bucket, selected, versioning, config.Exclude, progress); err != nil {
+		progress.SetPhase("deletion stopped")
 		return fmt.Errorf("delete selected prefixes: %w", err)
 	}
 
@@ -188,16 +207,46 @@ type bucketStatsScan struct {
 	mu       sync.Mutex
 	value    *bucketStatsResult
 	reported bool
+	progress BucketStats
+	renderer *ProgressRenderer
 }
 
 func startBucketStatsScan(ctx context.Context, client ObjectLister, bucket string, versioning Versioning, options BucketStatsOptions) *bucketStatsScan {
 	scanContext, cancel := context.WithCancel(ctx)
 	result := make(chan bucketStatsResult, 1)
+	scan := &bucketStatsScan{cancel: cancel, result: result}
 	go func() {
-		stats, err := ScanBucketStats(scanContext, client, bucket, versioning, options)
+		stats, err := ScanBucketStatsWithProgress(scanContext, client, bucket, versioning, options, scan.updateProgress)
 		result <- bucketStatsResult{stats: stats, err: err}
 	}()
-	return &bucketStatsScan{cancel: cancel, result: result}
+	return scan
+}
+
+func bucketScanPhase(progress BucketStats) string {
+	return fmt.Sprintf("waiting for whole-bucket statistics scan: %d pages, %d objects (%s) counted", progress.Pages, progress.Objects, formatBytes(progress.Bytes))
+}
+
+func (scan *bucketStatsScan) updateProgress(progress BucketStats) {
+	scan.mu.Lock()
+	scan.progress = progress
+	renderer := scan.renderer
+	scan.mu.Unlock()
+	if renderer != nil {
+		renderer.SetPhaseQuiet(bucketScanPhase(progress))
+	}
+}
+
+func (scan *bucketStatsScan) attachRenderer(renderer *ProgressRenderer) {
+	scan.mu.Lock()
+	defer scan.mu.Unlock()
+	renderer.SetPhaseQuiet(bucketScanPhase(scan.progress))
+	scan.renderer = renderer
+}
+
+func (scan *bucketStatsScan) detachRenderer() {
+	scan.mu.Lock()
+	scan.renderer = nil
+	scan.mu.Unlock()
 }
 
 func reportBucketStats(output io.Writer, scan *bucketStatsScan) {

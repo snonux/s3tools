@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
@@ -72,10 +73,13 @@ type ProgressRenderer struct {
 	output   io.Writer
 	terminal bool
 	now      func() time.Time
+	interval time.Duration
 
 	mu              sync.Mutex
+	begun           bool
 	started         bool
 	startTime       time.Time
+	phase           string
 	total           ProgressTotal
 	confirmed       ProgressTotal
 	bucketStats     *BucketStats
@@ -101,22 +105,72 @@ func newProgressRenderer(output io.Writer, terminal bool, now func() time.Time) 
 }
 
 func newProgressRendererWithBucketStats(output io.Writer, terminal bool, now func() time.Time, bucketStats *BucketStats) *ProgressRenderer {
-	return &ProgressRenderer{output: output, terminal: terminal, now: now, bucketStats: bucketStats, done: make(chan struct{})}
+	return &ProgressRenderer{output: output, terminal: terminal, now: now, interval: progressInterval, bucketStats: bucketStats, done: make(chan struct{})}
+}
+
+// Begin starts reporting status before the amount of work is known.
+func (renderer *ProgressRenderer) Begin(ctx context.Context) {
+	renderer.mu.Lock()
+	if renderer.begun || renderer.finishRequested {
+		renderer.mu.Unlock()
+		return
+	}
+	renderer.begun = true
+	renderer.startTime = renderer.now()
+	renderer.wg.Add(1)
+	renderer.mu.Unlock()
+
+	renderer.render(false)
+	go renderer.renderLoop(ctx)
+}
+
+// SetPhase describes the current operation and reports a change immediately.
+func (renderer *ProgressRenderer) SetPhase(phase string) {
+	if !renderer.setPhase(phase) {
+		return
+	}
+	renderer.render(false)
+}
+
+// SetPhaseQuiet describes the current operation for the next periodic report.
+func (renderer *ProgressRenderer) SetPhaseQuiet(phase string) {
+	_ = renderer.setPhase(phase)
+}
+
+func (renderer *ProgressRenderer) setPhase(phase string) bool {
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	if renderer.phase == phase {
+		return false
+	}
+	renderer.phase = phase
+	return renderer.begun && !renderer.finishRequested
+}
+
+// SetBucketStats updates the optional whole-bucket snapshot.
+func (renderer *ProgressRenderer) SetBucketStats(stats *BucketStats) {
+	renderer.mu.Lock()
+	renderer.bucketStats = stats
+	renderer.mu.Unlock()
 }
 
 // Start begins progress reporting for total work.
 func (renderer *ProgressRenderer) Start(ctx context.Context, total ProgressTotal) {
 	renderer.mu.Lock()
-	if renderer.started {
+	if renderer.started || (renderer.begun && renderer.finishRequested) {
 		renderer.mu.Unlock()
 		return
 	}
 	renderer.started = true
-	renderer.startTime = renderer.now()
+	startLoop := !renderer.begun && !renderer.finishRequested
+	if !renderer.begun {
+		renderer.begun = true
+		renderer.startTime = renderer.now()
+	}
 	renderer.total = total
-	renderer.samples = []progressSample{{at: renderer.startTime}}
+	renderer.samples = []progressSample{{at: renderer.now()}}
 	stopImmediately := renderer.finishRequested
-	if !stopImmediately {
+	if startLoop {
 		renderer.wg.Add(1)
 	}
 	renderer.mu.Unlock()
@@ -125,7 +179,9 @@ func (renderer *ProgressRenderer) Start(ctx context.Context, total ProgressTotal
 		renderer.finish()
 		return
 	}
-	go renderer.renderLoop(ctx)
+	if startLoop {
+		go renderer.renderLoop(ctx)
+	}
 }
 
 // Advance adds deletion work which S3 confirmed.
@@ -145,12 +201,10 @@ func (renderer *ProgressRenderer) Advance(confirmed ProgressTotal) {
 // Finish stops progress reporting and renders its final state.
 func (renderer *ProgressRenderer) Finish() {
 	renderer.mu.Lock()
-	started := renderer.started
-	if !started {
-		renderer.finishRequested = true
-	}
+	begun := renderer.begun
+	renderer.finishRequested = true
 	renderer.mu.Unlock()
-	if !started {
+	if !begun {
 		return
 	}
 	renderer.finish()
@@ -166,7 +220,7 @@ func (renderer *ProgressRenderer) finish() {
 
 func (renderer *ProgressRenderer) renderLoop(ctx context.Context) {
 	defer renderer.wg.Done()
-	ticker := time.NewTicker(progressInterval)
+	ticker := time.NewTicker(renderer.interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -182,14 +236,18 @@ func (renderer *ProgressRenderer) renderLoop(ctx context.Context) {
 
 func (renderer *ProgressRenderer) render(final bool) {
 	renderer.mu.Lock()
-	if !renderer.started {
-		renderer.mu.Unlock()
+	defer renderer.mu.Unlock()
+	if !renderer.begun || (!final && renderer.finishRequested) {
 		return
 	}
-	snapshot := renderer.snapshotLocked(renderer.now())
-	renderer.mu.Unlock()
-
-	line := formatProgress(snapshot)
+	now := renderer.now()
+	line := formatPendingProgress(renderer.phase, now.Sub(renderer.startTime))
+	if renderer.started {
+		line = formatProgress(renderer.snapshotLocked(now))
+		if renderer.phase != "" {
+			line = "status: " + renderer.phase + "; " + line
+		}
+	}
 	if renderer.terminal {
 		if final {
 			_, _ = fmt.Fprintf(renderer.output, "\r%s\033[K\n", line)
@@ -198,7 +256,14 @@ func (renderer *ProgressRenderer) render(final bool) {
 		_, _ = fmt.Fprintf(renderer.output, "\r%s\033[K", line)
 		return
 	}
-	_, _ = fmt.Fprintf(renderer.output, "%s %s\n", renderer.now().Format(time.RFC3339), line)
+	_, _ = fmt.Fprintf(renderer.output, "%s %s\n", now.Format(time.RFC3339), line)
+}
+
+func formatPendingProgress(phase string, elapsed time.Duration) string {
+	if phase == "" {
+		phase = "preparing"
+	}
+	return fmt.Sprintf("status: %s; total pending; elapsed %s", phase, formatDuration(elapsed))
 }
 
 func (renderer *ProgressRenderer) snapshotLocked(now time.Time) ProgressSnapshot {
@@ -243,7 +308,18 @@ func formatProgress(snapshot ProgressSnapshot) string {
 		formatDuration(snapshot.Elapsed),
 		eta,
 	)
-	return line + formatBucketRemainder(snapshot.BucketStats, snapshot.Confirmed)
+	return line + "; " + formatProgressBar(snapshot) + formatBucketRemainder(snapshot.BucketStats, snapshot.Confirmed)
+}
+
+func formatProgressBar(snapshot ProgressSnapshot) string {
+	const width = 12
+	percent := 100.0
+	if snapshot.Total.Objects > 0 {
+		percent = 100 * float64(snapshot.Confirmed.Objects) / float64(snapshot.Total.Objects)
+	}
+	percent = min(max(percent, 0), 100)
+	filled := int(percent * width / 100)
+	return fmt.Sprintf("progress [%s%s] %d%%", strings.Repeat("#", filled), strings.Repeat(".", width-filled), int(percent))
 }
 
 func formatBucketRemainder(stats *BucketStats, confirmed ProgressTotal) string {

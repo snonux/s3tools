@@ -89,10 +89,17 @@ s3rm -exclude keep/ -exclude legal/hold.txt \
 
 ## Progress and bucket statistics
 
-Before deletion, `s3rm` inventories all selected work. It reports confirmed
-object and byte counts, remaining work, throughput, elapsed time, and an ETA
-every two seconds. A terminal updates one line; redirected output emits
-timestamped log lines.
+`s3rm` reports its current phase immediately and refreshes status every two
+seconds, including while an S3 request is waiting. This covers connection,
+bucket discovery, optional bucket statistics, inventory, deletion, and final
+verification. Discovery shows completed pages and prefixes found. Inventory
+status shows completed pages and objects scanned; its
+total remains unknown until listing finishes. During deletion, status includes
+a progress bar, confirmed object and byte counts, remaining work, throughput,
+elapsed time, and an ETA. The final status says `deletion complete` once
+verification succeeds. A terminal updates one line; redirected output emits
+timestamped log lines. Interactive selection prompts pause status output until
+the bucket name has been confirmed.
 
 Use `--bucket-stats` in either interactive or batch mode to scan the whole
 bucket before deletion:

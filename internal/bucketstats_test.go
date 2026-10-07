@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -34,6 +35,28 @@ func TestScanBucketStatsCompletesAndCountsVersionedContents(t *testing.T) {
 	}
 	if !stats.Complete || stats.Objects != 2 || stats.Bytes != 3 || stats.Pages != 1 {
 		t.Fatalf("stats = %#v", stats)
+	}
+}
+
+func TestScanBucketStatsReportsPagesAndNoUpdateOnError(t *testing.T) {
+	client := &fakeObjectLister{objectPages: []*s3.ListObjectsV2Output{
+		{IsTruncated: aws.Bool(true), NextContinuationToken: aws.String("next"), Contents: []types.Object{{Key: aws.String("a"), Size: aws.Int64(3)}}},
+		{Contents: []types.Object{{Key: aws.String("b"), Size: aws.Int64(5)}}},
+	}}
+	var updates []BucketStats
+	stats, err := ScanBucketStatsWithProgress(context.Background(), client, "bucket", Unversioned, BucketStatsOptions{MaxPages: 2, Timeout: time.Second}, func(progress BucketStats) {
+		updates = append(updates, progress)
+	})
+	if err != nil || !stats.Complete || len(updates) != 2 || updates[0].Pages != 1 || updates[0].Objects != 1 || updates[0].Bytes != 3 || updates[1].Pages != 2 || updates[1].Objects != 2 || updates[1].Bytes != 8 {
+		t.Fatalf("stats = %#v, updates = %#v, error = %v", stats, updates, err)
+	}
+
+	updates = nil
+	client = &fakeObjectLister{objectErr: errors.New("denied")}
+	if _, err := ScanBucketStatsWithProgress(context.Background(), client, "bucket", Unversioned, BucketStatsOptions{Timeout: time.Second}, func(progress BucketStats) {
+		updates = append(updates, progress)
+	}); err == nil || len(updates) != 0 {
+		t.Fatalf("error = %v, updates = %#v", err, updates)
 	}
 }
 

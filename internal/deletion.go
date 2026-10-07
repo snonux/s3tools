@@ -66,8 +66,12 @@ func DeletePrefixWithProgress(ctx context.Context, client ObjectDeleter, bucket,
 	if err := ctx.Err(); err != nil {
 		return DeleteSummary{}, &PartialDeleteError{Cause: err}
 	}
-	inventory, err := InventoryPrefix(ctx, client, bucket, prefix, versioning, exclusions)
+	setProgressPhase(progress, fmt.Sprintf("inventorying prefix %q (1/1)", prefix))
+	inventory, err := InventoryPrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, func(scanned InventoryProgress) {
+		setProgressPhaseQuiet(progress, fmt.Sprintf("inventorying prefix %q (1/1): %d pages, %d objects (%s) scanned; total pending", prefix, scanned.Pages, scanned.Objects, formatBytes(scanned.Bytes)))
+	})
 	if err != nil {
+		setProgressPhase(progress, "deletion stopped")
 		return DeleteSummary{}, err
 	}
 	if progress != nil {
@@ -75,7 +79,13 @@ func DeletePrefixWithProgress(ctx context.Context, client ObjectDeleter, bucket,
 		defer progress.Finish()
 	}
 
-	return deleteInventory(ctx, client, bucket, prefix, inventory, versioning, exclusions, progress)
+	summary, err := deleteInventory(ctx, client, bucket, prefix, inventory, versioning, exclusions, progress)
+	if err != nil {
+		setProgressPhase(progress, "deletion stopped")
+	} else {
+		setProgressPhase(progress, "deletion complete")
+	}
+	return summary, err
 }
 
 // DeleteSelectedPrefixes inventories all selected prefixes before deletion,
@@ -87,8 +97,12 @@ func DeleteSelectedPrefixes(ctx context.Context, client ObjectDeleter, bucket st
 	inventories := make([]Inventory, len(prefixes))
 	total := ProgressTotal{}
 	for index, prefix := range prefixes {
-		inventory, err := InventoryPrefix(ctx, client, bucket, prefix, versioning, exclusions)
+		setProgressPhase(progress, fmt.Sprintf("inventorying prefix %q (%d/%d); completed %d objects (%s)", prefix, index+1, len(prefixes), total.Objects, formatBytes(total.Bytes)))
+		inventory, err := InventoryPrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, func(scanned InventoryProgress) {
+			setProgressPhaseQuiet(progress, fmt.Sprintf("inventorying prefix %q (%d/%d): %d pages, %d objects (%s) scanned here; %d objects (%s) in earlier prefixes; total pending", prefix, index+1, len(prefixes), scanned.Pages, scanned.Objects, formatBytes(scanned.Bytes), total.Objects, formatBytes(total.Bytes)))
+		})
 		if err != nil {
+			setProgressPhase(progress, "deletion stopped")
 			return DeleteSummary{}, err
 		}
 		inventories[index] = inventory
@@ -107,6 +121,7 @@ func DeleteSelectedPrefixes(ctx context.Context, client ObjectDeleter, bucket st
 		summary.DeletedBytes += deleted.DeletedBytes
 		summary.Failures = append(summary.Failures, deleted.Failures...)
 		if err != nil {
+			setProgressPhase(progress, "deletion stopped")
 			var partial *PartialDeleteError
 			if errors.As(err, &partial) && partial != nil {
 				partial.Summary = summary
@@ -114,6 +129,7 @@ func DeleteSelectedPrefixes(ctx context.Context, client ObjectDeleter, bucket st
 			return summary, err
 		}
 	}
+	setProgressPhase(progress, "deletion complete")
 
 	return summary, nil
 }
@@ -130,6 +146,7 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 		if end > len(inventory.Entries) {
 			end = len(inventory.Entries)
 		}
+		setProgressPhase(progress, fmt.Sprintf("deleting prefix %q, batch %d/%d", prefix, start/deleteBatchSize+1, (len(inventory.Entries)+deleteBatchSize-1)/deleteBatchSize))
 		before := summary
 		pending, err := deleteBatch(ctx, client, bucket, inventory.Entries[start:end], versioning, &summary)
 		// A mixed batch can confirm deletions before an individual request
@@ -146,7 +163,10 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 	if err := ctx.Err(); err != nil {
 		return summary, &PartialDeleteError{Summary: summary, Cause: err}
 	}
-	remaining, err := InventoryPrefix(ctx, client, bucket, prefix, versioning, exclusions)
+	setProgressPhase(progress, fmt.Sprintf("verifying prefix %q", prefix))
+	remaining, err := InventoryPrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, func(scanned InventoryProgress) {
+		setProgressPhaseQuiet(progress, fmt.Sprintf("verifying prefix %q: %d pages, %d objects scanned", prefix, scanned.Pages, scanned.Objects))
+	})
 	if err != nil {
 		return summary, &PartialDeleteError{Summary: summary, Cause: fmt.Errorf("verify deletion: %w", err)}
 	}
@@ -177,6 +197,18 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 		return summary, &PartialDeleteError{Summary: summary, Cause: cause}
 	}
 	return summary, nil
+}
+
+func setProgressPhase(progress ProgressObserver, phase string) {
+	if renderer, ok := progress.(interface{ SetPhase(string) }); ok {
+		renderer.SetPhase(phase)
+	}
+}
+
+func setProgressPhaseQuiet(progress ProgressObserver, phase string) {
+	if renderer, ok := progress.(interface{ SetPhaseQuiet(string) }); ok {
+		renderer.SetPhaseQuiet(phase)
+	}
 }
 
 func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entries []ObjectEntry, versioning Versioning, summary *DeleteSummary) ([]ObjectEntry, error) {
