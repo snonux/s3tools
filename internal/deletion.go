@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -44,10 +45,11 @@ type PartialDeleteError struct {
 
 // Error implements error.
 func (err *PartialDeleteError) Error() string {
+	failures := failureText(err.Summary.Failures)
 	if err.Cause != nil {
-		return fmt.Sprintf("partial deletion: %d object failures: %v", len(err.Summary.Failures), err.Cause)
+		return fmt.Sprintf("partial deletion: %d object failures%s: cause=%s", len(err.Summary.Failures), failures, strconv.Quote(err.Cause.Error()))
 	}
-	return fmt.Sprintf("partial deletion: %d object failures", len(err.Summary.Failures))
+	return fmt.Sprintf("partial deletion: %d object failures%s", len(err.Summary.Failures), failures)
 }
 
 // Unwrap returns the underlying request or verification error.
@@ -321,7 +323,16 @@ func hasFailure(failures []DeleteFailure, key, versionID string) bool {
 func failureText(failures []DeleteFailure) string {
 	parts := make([]string, 0, len(failures))
 	for _, failure := range failures {
-		parts = append(parts, failure.Key+":"+failure.Code)
+		part := " key=" + strconv.Quote(failure.Key)
+		if failure.VersionID != "" {
+			part += " version_id=" + strconv.Quote(failure.VersionID)
+		}
+		part += " code=" + strconv.Quote(failure.Code)
+		part += " message=" + strconv.Quote(failure.Message)
+		parts = append(parts, part)
 	}
-	return strings.Join(parts, ", ")
+	if len(parts) == 0 {
+		return ""
+	}
+	return ":" + strings.Join(parts, ";")
 }
