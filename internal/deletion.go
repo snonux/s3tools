@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -17,6 +18,7 @@ const deleteBatchSize = 1000
 type ObjectDeleter interface {
 	ObjectLister
 	DeleteObjects(context.Context, *s3.DeleteObjectsInput, ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
 // DeleteFailure identifies an object S3 did not delete.
@@ -175,14 +177,42 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 
 func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entries []ObjectEntry, versioning Versioning, summary *DeleteSummary) ([]ObjectEntry, error) {
 	objects := make([]types.ObjectIdentifier, 0, len(entries))
+	bulkEntries := make([]ObjectEntry, 0, len(entries))
+	individualEntries := make([]ObjectEntry, 0)
 	for _, entry := range entries {
+		if !xml10SafeValue(entry.Key) || (versioning == Versioned && !xml10SafeValue(entry.VersionID)) {
+			individualEntries = append(individualEntries, entry)
+			continue
+		}
 		object := types.ObjectIdentifier{Key: aws.String(entry.Key)}
 		if versioning == Versioned {
 			object.VersionId = aws.String(entry.VersionID)
 		}
 		objects = append(objects, object)
+		bulkEntries = append(bulkEntries, entry)
 	}
 
+	unacknowledged := make([]ObjectEntry, 0)
+	if len(objects) != 0 {
+		pending, err := deleteObjectsBatch(ctx, client, bucket, objects, bulkEntries, versioning, summary)
+		if err != nil {
+			return nil, err
+		}
+		unacknowledged = append(unacknowledged, pending...)
+	}
+
+	for _, entry := range individualEntries {
+		if err := deleteIndividualObject(ctx, client, bucket, entry, versioning); err != nil {
+			return nil, err
+		}
+		summary.Deleted++
+		summary.DeletedBytes += entry.Size
+	}
+
+	return unacknowledged, nil
+}
+
+func deleteObjectsBatch(ctx context.Context, client ObjectDeleter, bucket string, objects []types.ObjectIdentifier, entries []ObjectEntry, versioning Versioning, summary *DeleteSummary) ([]ObjectEntry, error) {
 	result, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: aws.String(bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(false)}})
 	if err != nil {
 		return nil, fmt.Errorf("delete batch: %w", err)
@@ -239,8 +269,39 @@ func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entri
 			summary.Failures = append(summary.Failures, DeleteFailure{Key: entry.Key, VersionID: entry.VersionID, Code: "Unconfirmed", Message: "S3 did not acknowledge deletion"})
 		}
 	}
-
 	return unacknowledged, nil
+}
+
+func deleteIndividualObject(ctx context.Context, client ObjectDeleter, bucket string, entry ObjectEntry, versioning Versioning) error {
+	input := &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(entry.Key)}
+	if versioning == Versioned {
+		input.VersionId = aws.String(entry.VersionID)
+	}
+	result, err := client.DeleteObject(ctx, input)
+	if err != nil {
+		return fmt.Errorf("delete object %q: %w", entry.Key, err)
+	}
+	if result == nil {
+		return fmt.Errorf("delete object %q: empty response", entry.Key)
+	}
+	return nil
+}
+
+// xml10SafeValue excludes carriage returns because XML normalizes them, as well
+// as characters XML 1.0 cannot represent. Those values need a path-based delete.
+func xml10SafeValue(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if character == '\r' || !(character == '\t' || character == '\n' ||
+			character >= 0x20 && character <= 0xD7FF ||
+			character >= 0xE000 && character <= 0xFFFD ||
+			character >= 0x10000 && character <= 0x10FFFF) {
+			return false
+		}
+	}
+	return true
 }
 
 func deletionKey(key, versionID string) string { return key + "\x00" + versionID }

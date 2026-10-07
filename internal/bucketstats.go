@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 const (
@@ -76,7 +77,7 @@ func scanUnversionedBucketStats(ctx context.Context, client ObjectLister, bucket
 		if stats.Pages == maxPages {
 			return incompleteBucketStats(stats, "page limit"), nil
 		}
-		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), ContinuationToken: continuationToken})
+		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), EncodingType: types.EncodingTypeUrl, ContinuationToken: continuationToken})
 		if err != nil {
 			if ctx.Err() != nil {
 				return incompleteBucketStats(stats, incompleteReason(ctx.Err())), nil
@@ -85,6 +86,9 @@ func scanUnversionedBucketStats(ctx context.Context, client ObjectLister, bucket
 		}
 		if result == nil {
 			return stats, fmt.Errorf("scan bucket %q: empty response", bucket)
+		}
+		if err := decodeListObjectsV2(result); err != nil {
+			return stats, fmt.Errorf("scan bucket %q: decode URL-encoded keys: %w", bucket, err)
 		}
 		stats.Pages++
 		for _, object := range result.Contents {
@@ -112,7 +116,7 @@ func scanVersionedBucketStats(ctx context.Context, client ObjectLister, bucket s
 		if stats.Pages == maxPages {
 			return incompleteBucketStats(stats, "page limit"), nil
 		}
-		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), KeyMarker: keyMarker, VersionIdMarker: versionMarker})
+		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), EncodingType: types.EncodingTypeUrl, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
 		if err != nil {
 			if ctx.Err() != nil {
 				return incompleteBucketStats(stats, incompleteReason(ctx.Err())), nil
@@ -121,6 +125,9 @@ func scanVersionedBucketStats(ctx context.Context, client ObjectLister, bucket s
 		}
 		if result == nil {
 			return stats, fmt.Errorf("scan bucket %q versions: empty response", bucket)
+		}
+		if err := decodeListObjectVersions(result); err != nil {
+			return stats, fmt.Errorf("scan bucket %q versions: decode URL-encoded keys: %w", bucket, err)
 		}
 		stats.Pages++
 		for _, object := range result.Versions {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,12 +13,14 @@ import (
 )
 
 type fakeDeleter struct {
-	versionPages  []*s3.ListObjectVersionsOutput
-	objectPages   []*s3.ListObjectsV2Output
-	objectErrors  []error
-	deleteOutputs []*s3.DeleteObjectsOutput
-	deleteErr     error
-	deleteInputs  []*s3.DeleteObjectsInput
+	versionPages       []*s3.ListObjectVersionsOutput
+	objectPages        []*s3.ListObjectsV2Output
+	objectErrors       []error
+	deleteOutputs      []*s3.DeleteObjectsOutput
+	deleteErr          error
+	deleteObjectErr    error
+	deleteInputs       []*s3.DeleteObjectsInput
+	singleDeleteInputs []*s3.DeleteObjectInput
 }
 
 func (client *fakeDeleter) ListObjectVersions(_ context.Context, _ *s3.ListObjectVersionsInput, _ ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error) {
@@ -47,6 +50,14 @@ func (client *fakeDeleter) DeleteObjects(_ context.Context, input *s3.DeleteObje
 	output := client.deleteOutputs[0]
 	client.deleteOutputs = client.deleteOutputs[1:]
 	return output, nil
+}
+
+func (client *fakeDeleter) DeleteObject(_ context.Context, input *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	client.singleDeleteInputs = append(client.singleDeleteInputs, input)
+	if client.deleteObjectErr != nil {
+		return nil, client.deleteObjectErr
+	}
+	return &s3.DeleteObjectOutput{}, nil
 }
 
 var _ ObjectDeleter = (*fakeDeleter)(nil)
@@ -83,6 +94,22 @@ func TestDeletePrefixPartialFailure(t *testing.T) {
 	summary, err := DeletePrefix(context.Background(), client, "bucket", "p/", Unversioned, nil)
 	if err == nil || len(summary.Failures) != 1 || !hasFailure(summary.Failures, "p/a", "") {
 		t.Fatalf("summary = %#v, error = %v", summary, err)
+	}
+}
+
+func TestDeletePrefixReportsIndividualDeleteRequestFailure(t *testing.T) {
+	requestErr := errors.New("offline")
+	client := &fakeDeleter{
+		objectPages:     []*s3.ListObjectsV2Output{{Contents: []types.Object{{Key: aws.String("p/control\x01.dat"), Size: aws.Int64(3)}}}},
+		deleteObjectErr: requestErr,
+	}
+
+	summary, err := DeletePrefix(context.Background(), client, "bucket", "p/", Unversioned, nil)
+	if !errors.Is(err, requestErr) {
+		t.Fatalf("DeletePrefix() error = %v, want wrapped request error", err)
+	}
+	if summary.Deleted != 0 || summary.DeletedBytes != 0 || len(client.deleteInputs) != 0 || len(client.singleDeleteInputs) != 1 {
+		t.Fatalf("summary = %#v, bulk deletes = %d, individual deletes = %d", summary, len(client.deleteInputs), len(client.singleDeleteInputs))
 	}
 }
 
@@ -166,7 +193,7 @@ func TestDeleteSelectedPrefixesCancellationKeepsAggregateSummaryAndCause(t *test
 func TestDeletePrefixBatchesAndRequestFailure(t *testing.T) {
 	entries := make([]types.ObjectVersion, deleteBatchSize+1)
 	for index := range entries {
-		entries[index] = types.ObjectVersion{Key: aws.String("p/" + string(rune(index+1))), VersionId: aws.String("v"), Size: aws.Int64(1)}
+		entries[index] = types.ObjectVersion{Key: aws.String("p/" + strconv.Itoa(index)), VersionId: aws.String("v"), Size: aws.Int64(1)}
 	}
 	deleted := make([]types.DeletedObject, 0, len(entries))
 	for _, entry := range entries {

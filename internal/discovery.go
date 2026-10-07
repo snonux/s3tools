@@ -8,6 +8,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // ObjectLister provides the S3 listing calls used by discovery and inventory.
@@ -72,12 +73,15 @@ func discoverVersionedPrefixes(ctx context.Context, client ObjectLister, bucket 
 	prefixes := make(map[string]struct{})
 	var keyMarker, versionMarker *string
 	for {
-		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), Delimiter: aws.String("/"), KeyMarker: keyMarker, VersionIdMarker: versionMarker})
+		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), Delimiter: aws.String("/"), EncodingType: types.EncodingTypeUrl, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
 		if err != nil {
 			return nil, fmt.Errorf("list versioned prefixes in %q: %w", bucket, err)
 		}
 		if result == nil {
 			return nil, fmt.Errorf("list versioned prefixes in %q: empty response", bucket)
+		}
+		if err := decodeListObjectVersions(result); err != nil {
+			return nil, fmt.Errorf("list versioned prefixes in %q: decode URL-encoded keys: %w", bucket, err)
 		}
 		for _, item := range result.CommonPrefixes {
 			prefix := aws.ToString(item.Prefix)
@@ -105,12 +109,15 @@ func discoverUnversionedPrefixes(ctx context.Context, client ObjectLister, bucke
 	prefixes := make(map[string]struct{})
 	var continuationToken *string
 	for {
-		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Delimiter: aws.String("/"), ContinuationToken: continuationToken})
+		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Delimiter: aws.String("/"), EncodingType: types.EncodingTypeUrl, ContinuationToken: continuationToken})
 		if err != nil {
 			return nil, fmt.Errorf("list prefixes in %q: %w", bucket, err)
 		}
 		if result == nil {
 			return nil, fmt.Errorf("list prefixes in %q: empty response", bucket)
+		}
+		if err := decodeListObjectsV2(result); err != nil {
+			return nil, fmt.Errorf("list prefixes in %q: decode URL-encoded keys: %w", bucket, err)
 		}
 		for _, item := range result.CommonPrefixes {
 			prefix := aws.ToString(item.Prefix)
@@ -135,12 +142,15 @@ func inventoryVersions(ctx context.Context, client ObjectLister, bucket, prefix 
 	inventory := Inventory{}
 	var keyMarker, versionMarker *string
 	for {
-		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), Prefix: aws.String(prefix), KeyMarker: keyMarker, VersionIdMarker: versionMarker})
+		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
 		if err != nil {
 			return Inventory{}, fmt.Errorf("list versions below %q: %w", prefix, err)
 		}
 		if result == nil {
 			return Inventory{}, fmt.Errorf("list versions below %q: empty response", prefix)
+		}
+		if err := decodeListObjectVersions(result); err != nil {
+			return Inventory{}, fmt.Errorf("list versions below %q: decode URL-encoded keys: %w", prefix, err)
 		}
 		for _, object := range result.Versions {
 			key := aws.ToString(object.Key)
@@ -168,12 +178,15 @@ func inventoryObjects(ctx context.Context, client ObjectLister, bucket, prefix s
 	inventory := Inventory{}
 	var continuationToken *string
 	for {
-		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(prefix), ContinuationToken: continuationToken})
+		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl, ContinuationToken: continuationToken})
 		if err != nil {
 			return Inventory{}, fmt.Errorf("list objects below %q: %w", prefix, err)
 		}
 		if result == nil {
 			return Inventory{}, fmt.Errorf("list objects below %q: empty response", prefix)
+		}
+		if err := decodeListObjectsV2(result); err != nil {
+			return Inventory{}, fmt.Errorf("list objects below %q: decode URL-encoded keys: %w", prefix, err)
 		}
 		for _, object := range result.Contents {
 			key := aws.ToString(object.Key)
