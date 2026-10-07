@@ -86,3 +86,40 @@ func TestInteractivePrompts(t *testing.T) {
 		t.Fatalf("prompt output = %q", text)
 	}
 }
+
+func TestSelectPrefixesStopsBucketScanWithoutCancellingDeletion(t *testing.T) {
+	choices := []PrefixChoice{{Prefix: "alpha/"}}
+	input := bufio.NewReader(strings.NewReader("s\n1\n"))
+	var output bytes.Buffer
+	cancelled := false
+	scan := &bucketStatsScan{cancel: func() { cancelled = true }}
+	selected, err := selectPrefixesWithStats(input, &output, choices, scan)
+	if err != nil || !reflect.DeepEqual(selected, []string{"alpha/"}) || !cancelled {
+		t.Fatalf("selectPrefixesWithStats() = %#v, %v; cancelled = %t", selected, err, cancelled)
+	}
+	if !strings.Contains(output.String(), "Bucket statistics scan cancelled") {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestReportBucketStatsLabelsOnlyCompleteScanAsTotal(t *testing.T) {
+	tests := []struct {
+		name  string
+		stats BucketStats
+		want  string
+	}{
+		{name: "complete", stats: BucketStats{Complete: true, Objects: 2, Bytes: 3}, want: "Bucket total: 2 objects (3 B)"},
+		{name: "incomplete", stats: BucketStats{Objects: 2, Bytes: 3, Incomplete: "page limit"}, want: "scan incomplete (page limit)"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			results := make(chan bucketStatsResult, 1)
+			results <- bucketStatsResult{stats: test.stats}
+			var output bytes.Buffer
+			reportBucketStats(&output, &bucketStatsScan{result: results})
+			if !strings.Contains(output.String(), test.want) {
+				t.Fatalf("output = %q, want %q", output.String(), test.want)
+			}
+		})
+	}
+}

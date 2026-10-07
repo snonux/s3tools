@@ -42,7 +42,10 @@ func run(ctx context.Context, args []string, interactiveTerminal, outputTerminal
 		if err != nil {
 			return err
 		}
-		return runInteractive(ctx, os.Stdin, os.Stdout, config, client)
+		return runInteractive(ctx, os.Stdin, os.Stdout, config, client, request.BucketStats, request.BucketStatsOptions)
+	}
+	if request.BucketStats {
+		return errors.New("--bucket-stats is available only in interactive mode")
 	}
 
 	if err := validateBatchRequestHeader(request, config.Bucket); err != nil {

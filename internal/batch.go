@@ -3,13 +3,17 @@ package internal
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // BatchRequest identifies the explicit targets required for a non-interactive run.
 type BatchRequest struct {
-	Prefixes        []string
-	ConfirmedBucket string
+	Prefixes           []string
+	ConfirmedBucket    string
+	BucketStats        bool
+	BucketStatsOptions BucketStatsOptions
 }
 
 // ParseBatchArgs extracts batch options and returns arguments for another mode.
@@ -39,7 +43,40 @@ func ParseBatchArgs(args []string) (BatchRequest, []string, error) {
 			index = nextIndex
 			continue
 		}
+		if argument == "--bucket-stats" {
+			request.BucketStats = true
+			continue
+		}
+		if value, found, attached := batchOptionValue(argument, "bucket-stats-pages"); found {
+			value, nextIndex, err := requiredBatchValue(value, attached, args, index, "--bucket-stats-pages")
+			if err != nil {
+				return BatchRequest{}, nil, err
+			}
+			pages, err := strconv.Atoi(value)
+			if err != nil || pages < 1 {
+				return BatchRequest{}, nil, errors.New("--bucket-stats-pages must be a positive integer")
+			}
+			request.BucketStatsOptions.MaxPages = pages
+			index = nextIndex
+			continue
+		}
+		if value, found, attached := batchOptionValue(argument, "bucket-stats-timeout"); found {
+			value, nextIndex, err := requiredBatchValue(value, attached, args, index, "--bucket-stats-timeout")
+			if err != nil {
+				return BatchRequest{}, nil, err
+			}
+			timeout, err := time.ParseDuration(value)
+			if err != nil || timeout <= 0 {
+				return BatchRequest{}, nil, errors.New("--bucket-stats-timeout must be a positive duration")
+			}
+			request.BucketStatsOptions.Timeout = timeout
+			index = nextIndex
+			continue
+		}
 		remaining = append(remaining, argument)
+	}
+	if !request.BucketStats && request.BucketStatsOptions != (BucketStatsOptions{}) {
+		return BatchRequest{}, nil, errors.New("--bucket-stats-pages and --bucket-stats-timeout require --bucket-stats")
 	}
 
 	return request, remaining, nil

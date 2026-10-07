@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -32,6 +33,9 @@ func TestParseBatchArgs(t *testing.T) {
 		{name: "missing prefix value", args: []string{"--prefix", "--confirm-bucket", "photos"}, wantError: "--prefix requires a value"},
 		{name: "missing confirmation value", args: []string{"--confirm-bucket="}, wantError: "--confirm-bucket requires a value"},
 		{name: "duplicate confirmation", args: []string{"--confirm-bucket", "photos", "--confirm-bucket", "photos"}, wantError: "may only be specified once"},
+		{name: "bucket statistics options", args: []string{"--bucket-stats", "--bucket-stats-pages", "12", "--bucket-stats-timeout=3s"}, want: BatchRequest{BucketStats: true, BucketStatsOptions: BucketStatsOptions{MaxPages: 12, Timeout: 3 * time.Second}}},
+		{name: "invalid bucket statistics page limit", args: []string{"--bucket-stats-pages=0"}, wantError: "positive integer"},
+		{name: "bucket statistics bounds require opt in", args: []string{"--bucket-stats-pages=12"}, wantError: "require --bucket-stats"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -45,7 +49,7 @@ func TestParseBatchArgs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.ConfirmedBucket != test.want.ConfirmedBucket || strings.Join(got.Prefixes, ",") != strings.Join(test.want.Prefixes, ",") || strings.Join(remaining, ",") != strings.Join(test.wantRemain, ",") {
+			if got.ConfirmedBucket != test.want.ConfirmedBucket || got.BucketStats != test.want.BucketStats || got.BucketStatsOptions != test.want.BucketStatsOptions || strings.Join(got.Prefixes, ",") != strings.Join(test.want.Prefixes, ",") || strings.Join(remaining, ",") != strings.Join(test.wantRemain, ",") {
 				t.Fatalf("ParseBatchArgs() = %#v, %#v; want %#v, %#v", got, remaining, test.want, test.wantRemain)
 			}
 		})
