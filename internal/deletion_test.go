@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -82,6 +83,83 @@ func TestDeletePrefixPartialFailure(t *testing.T) {
 	summary, err := DeletePrefix(context.Background(), client, "bucket", "p/", Unversioned, nil)
 	if err == nil || len(summary.Failures) != 1 || !hasFailure(summary.Failures, "p/a", "") {
 		t.Fatalf("summary = %#v, error = %v", summary, err)
+	}
+}
+
+func TestDeleteSelectedPrefixesPartialFailureKeepsAggregateSummary(t *testing.T) {
+	client := &fakeDeleter{
+		objectPages: []*s3.ListObjectsV2Output{
+			{Contents: []types.Object{{Key: aws.String("a/one"), Size: aws.Int64(10)}}},
+			{Contents: []types.Object{{Key: aws.String("b/two"), Size: aws.Int64(20)}}},
+			{},
+			{Contents: []types.Object{{Key: aws.String("b/two"), Size: aws.Int64(20)}}},
+		},
+		deleteOutputs: []*s3.DeleteObjectsOutput{
+			{Deleted: []types.DeletedObject{{Key: aws.String("a/one")}}},
+			{Errors: []types.Error{{Key: aws.String("b/two"), Code: aws.String("AccessDenied")}}},
+		},
+	}
+
+	summary, err := DeleteSelectedPrefixes(context.Background(), client, "bucket", []string{"a/", "b/"}, Unversioned, nil, nil)
+	if err == nil {
+		t.Fatal("expected partial deletion error")
+	}
+	var partial *PartialDeleteError
+	if !errors.As(err, &partial) {
+		t.Fatalf("error %T does not contain PartialDeleteError", err)
+	}
+	want := DeleteSummary{
+		Deleted:      1,
+		DeletedBytes: 10,
+		Failures:     []DeleteFailure{{Key: "b/two", Code: "AccessDenied"}},
+	}
+	if !reflect.DeepEqual(summary, want) {
+		t.Fatalf("summary = %#v, want %#v", summary, want)
+	}
+	if !reflect.DeepEqual(partial.Summary, summary) {
+		t.Fatalf("partial summary = %#v, returned summary = %#v", partial.Summary, summary)
+	}
+}
+
+func TestDeleteSelectedPrefixesCancellationKeepsAggregateSummaryAndCause(t *testing.T) {
+	client := &fakeDeleter{
+		objectPages: []*s3.ListObjectsV2Output{
+			{Contents: []types.Object{{Key: aws.String("a/one"), Size: aws.Int64(10)}}},
+			{Contents: []types.Object{{Key: aws.String("b/two"), Size: aws.Int64(20)}}},
+			{},
+		},
+		deleteOutputs: []*s3.DeleteObjectsOutput{
+			{Deleted: []types.DeletedObject{{Key: aws.String("a/one")}}},
+			{Deleted: []types.DeletedObject{{Key: aws.String("b/two")}}},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	advances := 0
+	progress := &recordingProgress{onAdvance: func() {
+		advances++
+		if advances == 2 {
+			cancel()
+		}
+	}}
+
+	summary, err := DeleteSelectedPrefixes(ctx, client, "bucket", []string{"a/", "b/"}, Unversioned, nil, progress)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var partial *PartialDeleteError
+	if !errors.As(err, &partial) {
+		t.Fatalf("error %T does not contain PartialDeleteError", err)
+	}
+	want := DeleteSummary{Deleted: 2, DeletedBytes: 30}
+	if !reflect.DeepEqual(summary, want) {
+		t.Fatalf("summary = %#v, want %#v", summary, want)
+	}
+	if !reflect.DeepEqual(partial.Summary, summary) {
+		t.Fatalf("partial summary = %#v, returned summary = %#v", partial.Summary, summary)
+	}
+	if partial.Cause != context.Canceled {
+		t.Fatalf("partial cause = %v, want %v", partial.Cause, context.Canceled)
 	}
 }
 

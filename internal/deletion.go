@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -102,6 +103,10 @@ func DeleteSelectedPrefixes(ctx context.Context, client ObjectDeleter, bucket st
 		summary.DeletedBytes += deleted.DeletedBytes
 		summary.Failures = append(summary.Failures, deleted.Failures...)
 		if err != nil {
+			var partial *PartialDeleteError
+			if errors.As(err, &partial) && partial != nil {
+				partial.Summary = summary
+			}
 			return summary, err
 		}
 	}
