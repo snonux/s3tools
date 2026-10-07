@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -132,6 +133,32 @@ func TestRunBatch(t *testing.T) {
 			t.Fatalf("delete requests = %#v", client.deleteInputs)
 		}
 	})
+}
+
+func TestRunBatchUsesCompleteBucketStatsBaseline(t *testing.T) {
+	setTestConfig(t)
+	client := &batchClient{fakeDeleter: fakeDeleter{
+		objectPages: []*s3.ListObjectsV2Output{
+			{CommonPrefixes: []types.CommonPrefix{{Prefix: aws.String("images/")}}},
+			{Contents: []types.Object{{Key: aws.String("images/a"), Size: aws.Int64(4)}, {Key: aws.String("archive/b"), Size: aws.Int64(6)}, {Key: aws.String("root.txt"), Size: aws.Int64(2)}}},
+			{Contents: []types.Object{{Key: aws.String("images/a"), Size: aws.Int64(4)}}},
+			{},
+		},
+		deleteOutputs: []*s3.DeleteObjectsOutput{{Deleted: []types.DeletedObject{{Key: aws.String("images/a")}}}},
+	}}
+	output := &bytes.Buffer{}
+	err := runWithOutput(context.Background(), []string{"--prefix", "images/", "--confirm-bucket", "photos", "--bucket-stats", "--bucket-stats-pages", "2"}, false, false, func(context.Context, Config) (S3API, error) {
+		return client, nil
+	}, output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(client.objectPages) != 0 || len(client.deleteInputs) != 1 {
+		t.Fatalf("remaining list pages = %d, delete calls = %d", len(client.objectPages), len(client.deleteInputs))
+	}
+	if !strings.Contains(output.String(), "bucket remainder estimate from snapshot") || !strings.Contains(output.String(), "2 objects (8 B)") {
+		t.Fatalf("progress output = %q, want a decremented bucket remainder estimate", output.String())
+	}
 }
 
 func setTestConfig(t *testing.T) {

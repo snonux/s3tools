@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var errInteractiveCancelled = errors.New("interactive deletion cancelled")
@@ -83,8 +84,9 @@ func runInteractive(ctx context.Context, input io.Reader, output io.Writer, conf
 	if err := confirmBucket(reader, output, config.Bucket, selected); err != nil {
 		return err
 	}
+	stats := bucketStatsScanResult(ctx, scan)
 	reportBucketStats(output, scan)
-	progress := NewProgressRenderer(output, true)
+	progress := NewProgressRendererWithBucketStats(output, true, stats)
 	if _, err := DeleteSelectedPrefixes(ctx, client, config.Bucket, selected, versioning, config.Exclude, progress); err != nil {
 		return fmt.Errorf("delete selected prefixes: %w", err)
 	}
@@ -181,8 +183,11 @@ type bucketStatsResult struct {
 }
 
 type bucketStatsScan struct {
-	cancel context.CancelFunc
-	result <-chan bucketStatsResult
+	cancel   context.CancelFunc
+	result   <-chan bucketStatsResult
+	mu       sync.Mutex
+	value    *bucketStatsResult
+	reported bool
 }
 
 func startBucketStatsScan(ctx context.Context, client ObjectLister, bucket string, versioning Versioning, options BucketStatsOptions) *bucketStatsScan {
@@ -199,10 +204,9 @@ func reportBucketStats(output io.Writer, scan *bucketStatsScan) {
 	if scan == nil {
 		return
 	}
-	select {
-	case result := <-scan.result:
+	if result, ok := scan.nextReport(); ok {
 		if result.err != nil {
-			_, _ = fmt.Fprintf(output, "Bucket statistics scan incomplete: %v\n", result.err)
+			_, _ = fmt.Fprintf(output, "Bucket statistics scan incomplete: %q\n", result.err.Error())
 			return
 		}
 		if result.stats.Complete {
@@ -210,6 +214,59 @@ func reportBucketStats(output io.Writer, scan *bucketStatsScan) {
 			return
 		}
 		_, _ = fmt.Fprintf(output, "Bucket statistics scan incomplete (%s): %d objects (%s)\n", result.stats.Incomplete, result.stats.Objects, formatBytes(result.stats.Bytes))
-	default:
 	}
+}
+
+func (scan *bucketStatsScan) nextReport() (bucketStatsResult, bool) {
+	result, ok := scan.poll()
+	if !ok {
+		return bucketStatsResult{}, false
+	}
+	scan.mu.Lock()
+	defer scan.mu.Unlock()
+	if scan.reported {
+		return bucketStatsResult{}, false
+	}
+	scan.reported = true
+	return result, true
+}
+
+func (scan *bucketStatsScan) poll() (bucketStatsResult, bool) {
+	scan.mu.Lock()
+	defer scan.mu.Unlock()
+	if scan.value != nil {
+		return *scan.value, true
+	}
+	select {
+	case result := <-scan.result:
+		scan.value = &result
+		return result, true
+	default:
+		return bucketStatsResult{}, false
+	}
+}
+
+func bucketStatsScanResult(ctx context.Context, scan *bucketStatsScan) *BucketStats {
+	if scan == nil {
+		return nil
+	}
+	if result, ok := scan.poll(); ok {
+		return bucketStatsResultStats(result)
+	}
+	select {
+	case result := <-scan.result:
+		scan.mu.Lock()
+		scan.value = &result
+		scan.mu.Unlock()
+		return bucketStatsResultStats(result)
+	case <-ctx.Done():
+		return &BucketStats{Incomplete: "cancelled"}
+	}
+}
+
+func bucketStatsResultStats(result bucketStatsResult) *BucketStats {
+	if result.err != nil {
+		return &BucketStats{Incomplete: "scan error"}
+	}
+	return &result.stats
 }

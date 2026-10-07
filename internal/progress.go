@@ -27,10 +27,11 @@ type ProgressRate struct {
 
 // ProgressSnapshot describes deletion work at a point in time.
 type ProgressSnapshot struct {
-	Total     ProgressTotal
-	Confirmed ProgressTotal
-	Elapsed   time.Duration
-	Rate      ProgressRate
+	Total       ProgressTotal
+	Confirmed   ProgressTotal
+	Elapsed     time.Duration
+	Rate        ProgressRate
+	BucketStats *BucketStats
 }
 
 // Remaining returns work which S3 has not confirmed as deleted.
@@ -77,6 +78,7 @@ type ProgressRenderer struct {
 	startTime       time.Time
 	total           ProgressTotal
 	confirmed       ProgressTotal
+	bucketStats     *BucketStats
 	samples         []progressSample
 	done            chan struct{}
 	finished        sync.Once
@@ -86,11 +88,20 @@ type ProgressRenderer struct {
 
 // NewProgressRenderer creates a renderer that reports every two seconds.
 func NewProgressRenderer(output io.Writer, terminal bool) *ProgressRenderer {
-	return newProgressRenderer(output, terminal, time.Now)
+	return NewProgressRendererWithBucketStats(output, terminal, nil)
+}
+
+// NewProgressRendererWithBucketStats creates a progress renderer with an optional whole-bucket snapshot.
+func NewProgressRendererWithBucketStats(output io.Writer, terminal bool, bucketStats *BucketStats) *ProgressRenderer {
+	return newProgressRendererWithBucketStats(output, terminal, time.Now, bucketStats)
 }
 
 func newProgressRenderer(output io.Writer, terminal bool, now func() time.Time) *ProgressRenderer {
-	return &ProgressRenderer{output: output, terminal: terminal, now: now, done: make(chan struct{})}
+	return newProgressRendererWithBucketStats(output, terminal, now, nil)
+}
+
+func newProgressRendererWithBucketStats(output io.Writer, terminal bool, now func() time.Time, bucketStats *BucketStats) *ProgressRenderer {
+	return &ProgressRenderer{output: output, terminal: terminal, now: now, bucketStats: bucketStats, done: make(chan struct{})}
 }
 
 // Start begins progress reporting for total work.
@@ -210,7 +221,7 @@ func (renderer *ProgressRenderer) snapshotLocked(now time.Time) ProgressSnapshot
 			}
 		}
 	}
-	return ProgressSnapshot{Total: renderer.total, Confirmed: renderer.confirmed, Elapsed: elapsed, Rate: rate}
+	return ProgressSnapshot{Total: renderer.total, Confirmed: renderer.confirmed, Elapsed: elapsed, Rate: rate, BucketStats: renderer.bucketStats}
 }
 
 func formatProgress(snapshot ProgressSnapshot) string {
@@ -219,7 +230,7 @@ func formatProgress(snapshot ProgressSnapshot) string {
 	if snapshot.ETA() > 0 || remaining.Objects == 0 {
 		eta = formatDuration(snapshot.ETA())
 	}
-	return fmt.Sprintf(
+	line := fmt.Sprintf(
 		"deleted %d/%d objects (%s/%s); remaining %d objects (%s); rate %s objects/s (%s/s); elapsed %s; ETA %s",
 		snapshot.Confirmed.Objects,
 		snapshot.Total.Objects,
@@ -232,6 +243,23 @@ func formatProgress(snapshot ProgressSnapshot) string {
 		formatDuration(snapshot.Elapsed),
 		eta,
 	)
+	return line + formatBucketRemainder(snapshot.BucketStats, snapshot.Confirmed)
+}
+
+func formatBucketRemainder(stats *BucketStats, confirmed ProgressTotal) string {
+	if stats == nil {
+		return ""
+	}
+	if !stats.Complete {
+		reason := stats.Incomplete
+		if reason == "" {
+			reason = "scan did not complete"
+		}
+		return fmt.Sprintf("; bucket remainder estimate unavailable (incomplete scan: %s)", reason)
+	}
+	remainingObjects := max(stats.Objects-int64(confirmed.Objects), int64(0))
+	remainingBytes := max(stats.Bytes-confirmed.Bytes, int64(0))
+	return fmt.Sprintf("; bucket remainder estimate from snapshot %s: %d objects (%s)", stats.SnapshotAt.Format(time.RFC3339), remainingObjects, formatBytes(remainingBytes))
 }
 
 func formatRate(rate float64) string {

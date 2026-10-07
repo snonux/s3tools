@@ -107,6 +107,28 @@ func TestFormatProgress(t *testing.T) {
 	}
 }
 
+func TestFormatProgressShowsSnapshotBucketRemainder(t *testing.T) {
+	snapshotTime := time.Date(2026, time.October, 7, 10, 30, 0, 0, time.UTC)
+	snapshot := ProgressSnapshot{
+		Total:       ProgressTotal{Objects: 2, Bytes: 20},
+		Confirmed:   ProgressTotal{Objects: 1, Bytes: 10},
+		BucketStats: &BucketStats{Objects: 4, Bytes: 40, Complete: true, SnapshotAt: snapshotTime},
+	}
+	got := formatProgress(snapshot)
+	want := "bucket remainder estimate from snapshot 2026-10-07T10:30:00Z: 3 objects (30 B)"
+	if !strings.Contains(got, want) {
+		t.Fatalf("formatProgress() = %q, want %q", got, want)
+	}
+}
+
+func TestFormatProgressMarksIncompleteBucketSnapshotUnavailable(t *testing.T) {
+	got := formatProgress(ProgressSnapshot{BucketStats: &BucketStats{Objects: 9, Bytes: 90, Incomplete: "page limit"}})
+	want := "bucket remainder estimate unavailable (incomplete scan: page limit)"
+	if !strings.Contains(got, want) {
+		t.Fatalf("formatProgress() = %q, want %q", got, want)
+	}
+}
+
 func TestProgressSnapshotKeepsFractionalRateAndETA(t *testing.T) {
 	snapshot := ProgressSnapshot{Total: ProgressTotal{Objects: 3}, Confirmed: ProgressTotal{Objects: 1}, Rate: ProgressRate{Objects: 0.5}}
 	if snapshot.ETA() != 4*time.Second {

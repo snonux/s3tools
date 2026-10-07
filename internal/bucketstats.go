@@ -29,6 +29,7 @@ type BucketStats struct {
 	Pages      int
 	Complete   bool
 	Incomplete string
+	SnapshotAt time.Time
 }
 
 // DefaultBucketStatsOptions returns the limits used for an opted-in scan.
@@ -97,6 +98,7 @@ func scanUnversionedBucketStats(ctx context.Context, client ObjectLister, bucket
 		}
 		if !aws.ToBool(result.IsTruncated) {
 			stats.Complete = true
+			stats.SnapshotAt = time.Now()
 			return stats, nil
 		}
 		if result.NextContinuationToken == nil {
@@ -137,6 +139,7 @@ func scanVersionedBucketStats(ctx context.Context, client ObjectLister, bucket s
 		stats.Objects += int64(len(result.DeleteMarkers))
 		if !aws.ToBool(result.IsTruncated) {
 			stats.Complete = true
+			stats.SnapshotAt = time.Now()
 			return stats, nil
 		}
 		if result.NextKeyMarker == nil || result.NextVersionIdMarker == nil {

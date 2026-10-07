@@ -3,6 +3,7 @@ package internal
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -169,5 +170,31 @@ func TestReportBucketStatsLabelsOnlyCompleteScanAsTotal(t *testing.T) {
 				t.Fatalf("output = %q, want %q", output.String(), test.want)
 			}
 		})
+	}
+}
+
+func TestReportBucketStatsReportsOnceAndKeepsSnapshot(t *testing.T) {
+	results := make(chan bucketStatsResult, 1)
+	results <- bucketStatsResult{stats: BucketStats{Complete: true, Objects: 2, Bytes: 3}}
+	scan := &bucketStatsScan{result: results}
+	var output bytes.Buffer
+	reportBucketStats(&output, scan)
+	reportBucketStats(&output, scan)
+	if got := strings.Count(output.String(), "Bucket total:"); got != 1 {
+		t.Fatalf("report count = %d, output = %q", got, output.String())
+	}
+	stats := bucketStatsScanResult(context.Background(), scan)
+	if stats == nil || !stats.Complete || stats.Objects != 2 || stats.Bytes != 3 {
+		t.Fatalf("cached stats = %#v", stats)
+	}
+}
+
+func TestReportBucketStatsEscapesScanError(t *testing.T) {
+	results := make(chan bucketStatsResult, 1)
+	results <- bucketStatsResult{err: errors.New("service\x1b[2J\r\nerror")}
+	var output bytes.Buffer
+	reportBucketStats(&output, &bucketStatsScan{result: results})
+	if !strings.Contains(output.String(), `"service\x1b[2J\r\nerror"`) || strings.Contains(output.String(), "\x1b") {
+		t.Fatalf("output = %q", output.String())
 	}
 }

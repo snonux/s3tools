@@ -94,14 +94,19 @@ object and byte counts, remaining work, throughput, elapsed time, and an ETA
 every two seconds. A terminal updates one line; redirected output emits
 timestamped log lines.
 
-Interactive mode can also scan the whole bucket with `--bucket-stats`:
+Use `--bucket-stats` in either interactive or batch mode to scan the whole
+bucket before deletion:
 
 ```sh
-s3rm --bucket-stats --bucket-stats-pages=1000 --bucket-stats-timeout=2m
+s3rm --prefix=logs/ --confirm-bucket=my-bucket --bucket-stats \
+  --bucket-stats-pages=1000 --bucket-stats-timeout=2m
 ```
 
-The defaults are 1,000 pages and two minutes. A stopped or bounded scan is
-clearly labelled incomplete, so its figures are not bucket totals.
+The defaults are 1,000 pages and two minutes. When the scan completes, its
+snapshot is the baseline for periodic whole-bucket remainder estimates; each
+estimate subtracts confirmed deletions. It reflects scan time and is approximate
+if other clients change the bucket concurrently. A stopped or bounded scan is
+clearly labelled incomplete, and its remainder estimate is unavailable.
 
 ## Docker
 

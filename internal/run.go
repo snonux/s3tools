@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"golang.org/x/term"
@@ -23,6 +24,10 @@ func Run(ctx context.Context, args []string) error {
 }
 
 func run(ctx context.Context, args []string, interactiveTerminal, outputTerminal bool, makeClient clientFactory) error {
+	return runWithOutput(ctx, args, interactiveTerminal, outputTerminal, makeClient, os.Stdout)
+}
+
+func runWithOutput(ctx context.Context, args []string, interactiveTerminal, outputTerminal bool, makeClient clientFactory, output io.Writer) error {
 	config, remaining, err := LoadConfig(args)
 	if err != nil {
 		return err
@@ -42,12 +47,8 @@ func run(ctx context.Context, args []string, interactiveTerminal, outputTerminal
 		if err != nil {
 			return err
 		}
-		return runInteractive(ctx, os.Stdin, os.Stdout, config, client, request.BucketStats, request.BucketStatsOptions)
+		return runInteractive(ctx, os.Stdin, output, config, client, request.BucketStats, request.BucketStatsOptions)
 	}
-	if request.BucketStats {
-		return errors.New("--bucket-stats is available only in interactive mode")
-	}
-
 	if err := validateBatchRequestHeader(request, config.Bucket); err != nil {
 		return err
 	}
@@ -69,12 +70,24 @@ func run(ctx context.Context, args []string, interactiveTerminal, outputTerminal
 	if err := ValidateBatchRequest(request, config.Bucket, available, config.Exclude); err != nil {
 		return err
 	}
-	progress := NewProgressRenderer(os.Stdout, outputTerminal)
+	stats := bucketStatsBaseline(ctx, client, config.Bucket, versioning, request.BucketStats, request.BucketStatsOptions)
+	progress := NewProgressRendererWithBucketStats(output, outputTerminal, stats)
 	if _, err := DeleteSelectedPrefixes(ctx, client, config.Bucket, request.Prefixes, versioning, config.Exclude, progress); err != nil {
 		return fmt.Errorf("delete selected prefixes: %w", err)
 	}
 
 	return nil
+}
+
+func bucketStatsBaseline(ctx context.Context, client ObjectLister, bucket string, versioning Versioning, enabled bool, options BucketStatsOptions) *BucketStats {
+	if !enabled {
+		return nil
+	}
+	stats, err := ScanBucketStats(ctx, client, bucket, versioning, options)
+	if err != nil {
+		stats.Incomplete = "scan error"
+	}
+	return &stats
 }
 
 func validateBatchRequestHeader(request BatchRequest, bucket string) error {
