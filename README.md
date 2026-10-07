@@ -30,4 +30,14 @@ progress reporting, and non-interactive examples.
 ```sh
 mage test
 mage build
+mage check
+```
+
+`mage check` runs `go vet ./...`, `go test -race ./...`, checks that
+`gofmt -l .` reports no files, and runs `errcheck ./...`. It requires Go,
+Mage, and [errcheck](https://github.com/kisielk/errcheck) on `PATH`. Install
+errcheck with:
+
+```sh
+go install github.com/kisielk/errcheck@latest
 ```
