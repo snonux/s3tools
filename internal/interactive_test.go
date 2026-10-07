@@ -78,12 +78,60 @@ func TestInteractivePrompts(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(selected, []string{"alpha/"}) {
 		t.Fatalf("selectPrefixes() = %#v, %v", selected, err)
 	}
-	if err := confirmBucket(input, &output, "archive"); err != nil {
+	if err := confirmBucket(input, &output, "archive", selected); err != nil {
 		t.Fatal(err)
 	}
 	text := output.String()
-	if !strings.Contains(text, "2. keep/ (protected)") || !strings.Contains(text, "Type bucket name \"archive\"") {
+	if !strings.Contains(text, `2. "keep/" (protected)`) ||
+		!strings.Contains(text, "Selected prefixes:\n- \"alpha/\"\nType bucket name \"archive\"") {
 		t.Fatalf("prompt output = %q", text)
+	}
+}
+
+func TestInteractivePrefixDisplayEscapesControlsAndPreservesKeys(t *testing.T) {
+	choices := []PrefixChoice{
+		{Prefix: "important/\n2. harmless/"},
+		{Prefix: "carriage\rreturn"},
+		{Prefix: "escape\x1b[31m"},
+		{Prefix: "unicode\u202econtrol"},
+	}
+	input := bufio.NewReader(strings.NewReader("1,2,3,4\narchive\n"))
+	var output bytes.Buffer
+	selected, err := selectPrefixes(input, &output, choices)
+	if err != nil {
+		t.Fatalf("selectPrefixes() error = %v", err)
+	}
+	if !reflect.DeepEqual(selected, []string{
+		"important/\n2. harmless/",
+		"carriage\rreturn",
+		"escape\x1b[31m",
+		"unicode\u202econtrol",
+	}) {
+		t.Fatalf("selected = %#v, want original prefix keys", selected)
+	}
+	if err := confirmBucket(input, &output, "archive", selected); err != nil {
+		t.Fatalf("confirmBucket() error = %v", err)
+	}
+
+	text := output.String()
+	for _, prefix := range []string{
+		`1. "important/\n2. harmless/"`,
+		`2. "carriage\rreturn"`,
+		`3. "escape\x1b[31m"`,
+		`4. "unicode\u202econtrol"`,
+		`- "important/\n2. harmless/"`,
+		`- "carriage\rreturn"`,
+		`- "escape\x1b[31m"`,
+		`- "unicode\u202econtrol"`,
+	} {
+		if !strings.Contains(text, prefix) {
+			t.Errorf("prompt output does not contain escaped prefix %q: %q", prefix, text)
+		}
+	}
+	for _, control := range []string{"\n2. harmless/", "\r", "\x1b", "\u202e"} {
+		if strings.Contains(text, control) {
+			t.Errorf("prompt output contains raw control %q: %q", control, text)
+		}
 	}
 }
 

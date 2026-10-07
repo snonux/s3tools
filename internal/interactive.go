@@ -80,7 +80,7 @@ func runInteractive(ctx context.Context, input io.Reader, output io.Writer, conf
 		return err
 	}
 	reportBucketStats(output, scan)
-	if err := confirmBucket(reader, output, config.Bucket); err != nil {
+	if err := confirmBucket(reader, output, config.Bucket, selected); err != nil {
 		return err
 	}
 	reportBucketStats(output, scan)
@@ -117,7 +117,7 @@ func selectPrefixesWithStats(input *bufio.Reader, output io.Writer, choices []Pr
 		if choice.Protected {
 			status = " (protected)"
 		}
-		if _, err := fmt.Fprintf(output, "%d. %s%s\n", index+1, choice.Prefix, status); err != nil {
+		if _, err := fmt.Fprintf(output, "%d. %q%s\n", index+1, choice.Prefix, status); err != nil {
 			return nil, fmt.Errorf("print prefix: %w", err)
 		}
 	}
@@ -145,7 +145,15 @@ func selectPrefixesWithStats(input *bufio.Reader, output io.Writer, choices []Pr
 	}
 }
 
-func confirmBucket(input *bufio.Reader, output io.Writer, bucket string) error {
+func confirmBucket(input *bufio.Reader, output io.Writer, bucket string, selected []string) error {
+	if _, err := fmt.Fprintln(output, "Selected prefixes:"); err != nil {
+		return fmt.Errorf("print selected prefixes: %w", err)
+	}
+	for _, prefix := range selected {
+		if _, err := fmt.Fprintf(output, "- %q\n", prefix); err != nil {
+			return fmt.Errorf("print selected prefix: %w", err)
+		}
+	}
 	if _, err := fmt.Fprintf(output, "Type bucket name %q to confirm deletion: ", bucket); err != nil {
 		return fmt.Errorf("print confirmation prompt: %w", err)
 	}
