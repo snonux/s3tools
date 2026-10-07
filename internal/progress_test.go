@@ -3,6 +3,8 @@ package internal
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +92,75 @@ func TestDeleteSelectedPrefixesStopsOnCancellation(t *testing.T) {
 	}
 	if progress.finished != 1 {
 		t.Fatalf("finished = %d", progress.finished)
+	}
+}
+
+func TestDeleteSelectedPrefixesReportsConfirmedProgressBeforeIndividualFailure(t *testing.T) {
+	requestErr := errors.New("individual delete failed")
+	tests := []struct {
+		name       string
+		objects    []types.Object
+		bulkOutput *s3.DeleteObjectsOutput
+		singleErrs []error
+		want       ProgressTotal
+	}{
+		{
+			name: "confirmed bulk delete before individual failure",
+			objects: []types.Object{
+				{Key: aws.String("p/ordinary"), Size: aws.Int64(10)},
+				{Key: aws.String("p/control\x01"), Size: aws.Int64(20)},
+			},
+			bulkOutput: &s3.DeleteObjectsOutput{Deleted: []types.DeletedObject{{Key: aws.String("p/ordinary")}}},
+			singleErrs: []error{requestErr},
+			want:       ProgressTotal{Objects: 1, Bytes: 10},
+		},
+		{
+			name: "confirmed individual delete before later failure",
+			objects: []types.Object{
+				{Key: aws.String("p/control\x01"), Size: aws.Int64(20)},
+				{Key: aws.String("p/control\x02"), Size: aws.Int64(30)},
+			},
+			singleErrs: []error{nil, requestErr},
+			want:       ProgressTotal{Objects: 1, Bytes: 20},
+		},
+		{
+			name: "unacknowledged bulk delete is not counted without verification",
+			objects: []types.Object{
+				{Key: aws.String("p/ordinary"), Size: aws.Int64(10)},
+				{Key: aws.String("p/control\x01"), Size: aws.Int64(20)},
+			},
+			bulkOutput: &s3.DeleteObjectsOutput{},
+			singleErrs: []error{requestErr},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &fakeDeleter{
+				objectPages:        []*s3.ListObjectsV2Output{{Contents: test.objects}},
+				deleteObjectErrors: test.singleErrs,
+			}
+			if test.bulkOutput != nil {
+				client.deleteOutputs = []*s3.DeleteObjectsOutput{test.bulkOutput}
+			}
+			var output bytes.Buffer
+			stats := &BucketStats{Complete: true, Objects: 5, Bytes: 100}
+			progress := NewProgressRendererWithBucketStats(&output, false, stats)
+			summary, err := DeleteSelectedPrefixes(context.Background(), client, "bucket", []string{"p/"}, Unversioned, nil, progress)
+			if !errors.Is(err, requestErr) {
+				t.Fatalf("error = %v, want original individual deletion error", err)
+			}
+			if summary.Deleted != test.want.Objects || summary.DeletedBytes != test.want.Bytes {
+				t.Fatalf("summary = %#v, want confirmed work %#v", summary, test.want)
+			}
+			want := fmt.Sprintf("deleted %d/%d objects", test.want.Objects, len(test.objects))
+			if !strings.Contains(output.String(), want) {
+				t.Fatalf("final progress = %q, want %q", output.String(), want)
+			}
+			want = fmt.Sprintf("%d objects (%s)", stats.Objects-int64(test.want.Objects), formatBytes(stats.Bytes-test.want.Bytes))
+			if !strings.Contains(output.String(), "bucket remainder estimate from snapshot") || !strings.Contains(output.String(), want) {
+				t.Fatalf("final progress = %q, want bucket remainder %q", output.String(), want)
+			}
+		})
 	}
 }
 

@@ -19,6 +19,7 @@ type fakeDeleter struct {
 	deleteOutputs      []*s3.DeleteObjectsOutput
 	deleteErr          error
 	deleteObjectErr    error
+	deleteObjectErrors []error
 	deleteInputs       []*s3.DeleteObjectsInput
 	singleDeleteInputs []*s3.DeleteObjectInput
 }
@@ -54,6 +55,13 @@ func (client *fakeDeleter) DeleteObjects(_ context.Context, input *s3.DeleteObje
 
 func (client *fakeDeleter) DeleteObject(_ context.Context, input *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
 	client.singleDeleteInputs = append(client.singleDeleteInputs, input)
+	if len(client.deleteObjectErrors) > 0 {
+		err := client.deleteObjectErrors[0]
+		client.deleteObjectErrors = client.deleteObjectErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if client.deleteObjectErr != nil {
 		return nil, client.deleteObjectErr
 	}

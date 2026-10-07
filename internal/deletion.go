@@ -132,13 +132,15 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 		}
 		before := summary
 		pending, err := deleteBatch(ctx, client, bucket, inventory.Entries[start:end], versioning, &summary)
+		// A mixed batch can confirm deletions before an individual request
+		// fails. Publish that work before returning the partial failure.
+		if progress != nil {
+			progress.Advance(ProgressTotal{Objects: summary.Deleted - before.Deleted, Bytes: summary.DeletedBytes - before.DeletedBytes})
+		}
 		if err != nil {
 			return summary, &PartialDeleteError{Summary: summary, Cause: err}
 		}
 		unacknowledged = append(unacknowledged, pending...)
-		if progress != nil {
-			progress.Advance(ProgressTotal{Objects: summary.Deleted - before.Deleted, Bytes: summary.DeletedBytes - before.DeletedBytes})
-		}
 	}
 
 	if err := ctx.Err(); err != nil {
