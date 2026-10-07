@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -11,6 +12,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+const defaultS3RequestTimeout = 2 * time.Minute
 
 // Versioning describes the deletion API required by a bucket.
 type Versioning uint8
@@ -34,9 +37,7 @@ func NewS3Client(ctx context.Context, settings Config) (*s3.Client, error) {
 
 func newS3Client(ctx context.Context, settings Config, httpClient *http.Client) (*s3.Client, error) {
 	loadOptions := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(settings.Region)}
-	if httpClient != nil {
-		loadOptions = append(loadOptions, awsconfig.WithHTTPClient(httpClient))
-	}
+	loadOptions = append(loadOptions, awsconfig.WithHTTPClient(requestHTTPClient(httpClient)))
 	if settings.AccessKeyID != "" {
 		provider := credentials.NewStaticCredentialsProvider(settings.AccessKeyID, settings.SecretAccessKey, settings.SessionToken)
 		loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(provider))
@@ -54,6 +55,18 @@ func newS3Client(ctx context.Context, settings Config, httpClient *http.Client) 
 			client.BaseEndpoint = aws.String(options.endpoint)
 		}
 	}), nil
+}
+
+func requestHTTPClient(client *http.Client) *http.Client {
+	if client == nil {
+		return &http.Client{Timeout: defaultS3RequestTimeout}
+	}
+
+	clientCopy := *client
+	if clientCopy.Timeout == 0 {
+		clientCopy.Timeout = defaultS3RequestTimeout
+	}
+	return &clientCopy
 }
 
 // DetectVersioning returns the listing and deletion mode for bucket.

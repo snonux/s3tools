@@ -37,6 +37,12 @@ export AWS_SECRET_ACCESS_KEY=...
 export AWS_SESSION_TOKEN=... # optional
 ```
 
+Each S3 HTTP attempt has a two-minute timeout covering connection setup,
+response headers, and reading the response body. The caller's context can end
+an attempt sooner. The AWS SDK keeps its normal retry policy, so one API call
+can include multiple bounded attempts. The timeout applies per attempt, so
+listing and deleting a large bucket can take longer overall.
+
 For a custom endpoint, `s3rm` uses path-style addressing unless
 `use_virtual_host_style` is set. This works with Garage and is normally the
 right choice for RADOS Gateway too.
