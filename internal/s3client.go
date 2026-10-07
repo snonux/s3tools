@@ -3,10 +3,10 @@ package internal
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -35,9 +35,9 @@ func NewS3Client(ctx context.Context, settings Config) (*s3.Client, error) {
 	return newS3Client(ctx, settings, nil)
 }
 
-func newS3Client(ctx context.Context, settings Config, httpClient *http.Client) (*s3.Client, error) {
+func newS3Client(ctx context.Context, settings Config, httpClient aws.HTTPClient) (*s3.Client, error) {
 	loadOptions := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(settings.Region)}
-	loadOptions = append(loadOptions, awsconfig.WithHTTPClient(requestHTTPClient(httpClient)))
+	loadOptions = append(loadOptions, awsconfig.WithHTTPClient(s3HTTPClient(httpClient)))
 	if settings.AccessKeyID != "" {
 		provider := credentials.NewStaticCredentialsProvider(settings.AccessKeyID, settings.SecretAccessKey, settings.SessionToken)
 		loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(provider))
@@ -57,16 +57,11 @@ func newS3Client(ctx context.Context, settings Config, httpClient *http.Client) 
 	}), nil
 }
 
-func requestHTTPClient(client *http.Client) *http.Client {
+func s3HTTPClient(client aws.HTTPClient) aws.HTTPClient {
 	if client == nil {
-		return &http.Client{Timeout: defaultS3RequestTimeout}
+		return awshttp.NewBuildableClient().WithTimeout(defaultS3RequestTimeout)
 	}
-
-	clientCopy := *client
-	if clientCopy.Timeout == 0 {
-		clientCopy.Timeout = defaultS3RequestTimeout
-	}
-	return &clientCopy
+	return client
 }
 
 // DetectVersioning returns the listing and deletion mode for bucket.

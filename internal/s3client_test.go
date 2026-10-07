@@ -3,15 +3,20 @@ package internal
 import (
 	"bytes"
 	"context"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -148,25 +153,73 @@ func TestNewS3ClientUsesConfiguredEndpointAndCredentials(t *testing.T) {
 	}
 }
 
-func TestRequestHTTPClientAppliesDefaultTimeoutWithoutChangingCallerClient(t *testing.T) {
-	callerClient := &http.Client{}
-	configuredClient := requestHTTPClient(callerClient)
-	if configuredClient == callerClient {
-		t.Fatal("requestHTTPClient() returned the caller's client; want a copy")
+func TestS3HTTPClientKeepsSDKBuildableClientWithDefaultTimeout(t *testing.T) {
+	defaultClient := s3HTTPClient(nil)
+	client, ok := defaultClient.(*awshttp.BuildableClient)
+	if !ok {
+		t.Fatalf("default HTTP client type = %T, want *awshttp.BuildableClient", defaultClient)
 	}
-	if configuredClient.Timeout != defaultS3RequestTimeout {
-		t.Errorf("Timeout = %s, want %s", configuredClient.Timeout, defaultS3RequestTimeout)
+	if got := client.GetTimeout(); got != defaultS3RequestTimeout {
+		t.Errorf("default timeout = %s, want %s", got, defaultS3RequestTimeout)
 	}
-	if callerClient.Timeout != 0 {
-		t.Errorf("caller Timeout = %s, want unchanged zero value", callerClient.Timeout)
-	}
-	if got := requestHTTPClient(nil).Timeout; got != defaultS3RequestTimeout {
-		t.Errorf("default client Timeout = %s, want %s", got, defaultS3RequestTimeout)
+	if transport := client.GetTransport(); transport.TLSHandshakeTimeout <= 0 {
+		t.Error("SDK buildable transport lost its TLS handshake timeout")
 	}
 
-	customTimeout := time.Second
-	if got := requestHTTPClient(&http.Client{Timeout: customTimeout}).Timeout; got != customTimeout {
-		t.Errorf("custom Timeout = %s, want %s", got, customTimeout)
+	callerClient := &http.Client{}
+	if got := s3HTTPClient(callerClient); got != callerClient {
+		t.Errorf("injected HTTP client = %T, want original client %p", got, callerClient)
+	}
+}
+
+func TestNewS3ClientSupportsCustomCABundle(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	certificatePath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certificatePath, certificate, 0o600); err != nil {
+		t.Fatalf("write certificate bundle: %v", err)
+	}
+	t.Setenv("AWS_CA_BUNDLE", certificatePath)
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "config"))
+
+	client, err := NewS3Client(context.Background(), Config{Region: "us-east-1", AccessKeyID: "key", SecretAccessKey: "secret"})
+	if err != nil {
+		t.Fatalf("NewS3Client() with AWS_CA_BUNDLE error = %v", err)
+	}
+	if _, ok := client.Options().HTTPClient.(*awshttp.BuildableClient); !ok {
+		t.Fatalf("HTTP client type = %T, want *awshttp.BuildableClient", client.Options().HTTPClient)
+	}
+}
+
+func TestNewS3ClientDoesNotFollowRedirects(t *testing.T) {
+	var redirectTargetHit atomic.Bool
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/target" {
+			redirectTargetHit.Store(true)
+			_, _ = io.WriteString(writer, `<?xml version="1.0"?><ListBucketResult/>`)
+			return
+		}
+		http.Redirect(writer, request, server.URL+"/target", http.StatusMovedPermanently)
+	}))
+	defer server.Close()
+
+	client, err := NewS3Client(context.Background(), Config{
+		Region:          "us-east-1",
+		Endpoint:        server.URL,
+		AccessKeyID:     "key",
+		SecretAccessKey: "secret",
+	})
+	if err != nil {
+		t.Fatalf("NewS3Client() error = %v", err)
+	}
+	if _, err := client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{Bucket: aws.String("bucket")}); err == nil {
+		t.Fatal("ListObjectsV2() error = nil after redirect, want S3 redirect response error")
+	}
+	if redirectTargetHit.Load() {
+		t.Fatal("S3 client followed an HTTP redirect")
 	}
 }
 
@@ -181,6 +234,7 @@ func TestS3RequestTimeoutBoundsStalledResponses(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("AWS_MAX_ATTEMPTS", "1")
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 				if test.stallBody {
 					writer.Header().Set("Content-Type", "application/xml")
@@ -197,19 +251,14 @@ func TestS3RequestTimeoutBoundsStalledResponses(t *testing.T) {
 				Endpoint:        server.URL,
 				AccessKeyID:     "key",
 				SecretAccessKey: "secret",
-			}, &http.Client{Timeout: requestTimeout})
+			}, awshttp.NewBuildableClient().WithTimeout(requestTimeout))
 			if err != nil {
 				t.Fatalf("newS3Client() error = %v", err)
 			}
 
-			started := time.Now()
-			_, err = client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{Bucket: aws.String("bucket")})
-			elapsed := time.Since(started)
+			err = listObjectsWithTestDeadline(t, client)
 			if err == nil {
 				t.Fatal("ListObjectsV2() error = nil, want timeout error")
-			}
-			if elapsed > 5*time.Second {
-				t.Errorf("ListObjectsV2() took %s, want bounded failure within 5s", elapsed)
 			}
 			if !strings.Contains(strings.ToLower(err.Error()), "timeout") && !strings.Contains(strings.ToLower(err.Error()), "deadline") {
 				t.Errorf("ListObjectsV2() error = %v, want timeout or deadline context", err)
@@ -219,6 +268,7 @@ func TestS3RequestTimeoutBoundsStalledResponses(t *testing.T) {
 }
 
 func TestS3RequestPreservesCallerCancellation(t *testing.T) {
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
 		<-request.Context().Done()
 	}))
@@ -229,7 +279,7 @@ func TestS3RequestPreservesCallerCancellation(t *testing.T) {
 		Endpoint:        server.URL,
 		AccessKeyID:     "key",
 		SecretAccessKey: "secret",
-	}, &http.Client{Timeout: time.Second})
+	}, awshttp.NewBuildableClient().WithTimeout(time.Second))
 	if err != nil {
 		t.Fatalf("newS3Client() error = %v", err)
 	}
@@ -246,5 +296,29 @@ func TestS3RequestPreservesCallerCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("ListObjectsV2() error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func listObjectsWithTestDeadline(t *testing.T, client *s3.Client) error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String("bucket")})
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(2 * time.Second):
+		cancel()
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+			t.Fatal("ListObjectsV2() did not stop after test context cancellation")
+		}
+		t.Fatal("ListObjectsV2() exceeded the independent 2s test deadline")
+		return nil
 	}
 }
