@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,25 @@ type recordingProgress struct {
 	advanced  []ProgressTotal
 	finished  int
 	onAdvance func()
+}
+
+type recordingStreamingProgress struct {
+	recordingProgress
+	streamStarted int
+	discovered    []ProgressTotal
+	completed     int
+}
+
+func (progress *recordingStreamingProgress) StartStreaming(_ context.Context) {
+	progress.streamStarted++
+}
+
+func (progress *recordingStreamingProgress) Discover(total ProgressTotal) {
+	progress.discovered = append(progress.discovered, total)
+}
+
+func (progress *recordingStreamingProgress) CompleteDiscovery() {
+	progress.completed++
 }
 
 func (progress *recordingProgress) Start(_ context.Context, total ProgressTotal) {
@@ -35,13 +55,38 @@ func (progress *recordingProgress) Advance(confirmed ProgressTotal) {
 func (progress *recordingProgress) Finish() { progress.finished++ }
 
 var _ ProgressObserver = (*recordingProgress)(nil)
+var _ StreamingProgressObserver = (*recordingStreamingProgress)(nil)
 
-func TestDeleteSelectedPrefixesAccountsAllInventoryBeforeDeleting(t *testing.T) {
+func TestDeleteSelectedPrefixesReportsStreamingDiscovery(t *testing.T) {
+	client := &fakeDeleter{
+		objectPages: []*s3.ListObjectsV2Output{
+			{Contents: []types.Object{{Key: aws.String("p/a"), Size: aws.Int64(3)}}},
+			{},
+		},
+		deleteOutputs: []*s3.DeleteObjectsOutput{{Deleted: []types.DeletedObject{{Key: aws.String("p/a")}}}},
+	}
+	progress := &recordingStreamingProgress{}
+	summary, err := DeleteSelectedPrefixes(context.Background(), client, "bucket", []string{"p/"}, Unversioned, nil, progress)
+	if err != nil || summary.Deleted != 1 || summary.DeletedBytes != 3 {
+		t.Fatalf("deletion = %#v, %v", summary, err)
+	}
+	if progress.streamStarted != 1 || progress.completed != 1 || progress.finished != 1 {
+		t.Fatalf("lifecycle: start=%d complete=%d finish=%d", progress.streamStarted, progress.completed, progress.finished)
+	}
+	if len(progress.discovered) != 1 || progress.discovered[0] != (ProgressTotal{Objects: 1, Bytes: 3}) {
+		t.Fatalf("discovered = %#v", progress.discovered)
+	}
+	if len(progress.advanced) != 1 || progress.advanced[0] != (ProgressTotal{Objects: 1, Bytes: 3}) {
+		t.Fatalf("advanced = %#v", progress.advanced)
+	}
+}
+
+func TestDeleteSelectedPrefixesStreamsProgressAsPrefixesFinish(t *testing.T) {
 	client := &fakeDeleter{
 		objectPages: []*s3.ListObjectsV2Output{
 			{Contents: []types.Object{{Key: aws.String("a/file"), Size: aws.Int64(3)}}},
-			{Contents: []types.Object{{Key: aws.String("b/file"), Size: aws.Int64(5)}}},
 			{},
+			{Contents: []types.Object{{Key: aws.String("b/file"), Size: aws.Int64(5)}}},
 			{},
 		},
 		deleteOutputs: []*s3.DeleteObjectsOutput{
@@ -57,7 +102,7 @@ func TestDeleteSelectedPrefixesAccountsAllInventoryBeforeDeleting(t *testing.T) 
 	if summary.Deleted != 2 || summary.DeletedBytes != 8 {
 		t.Fatalf("summary = %#v", summary)
 	}
-	if len(progress.started) != 1 || progress.started[0] != (ProgressTotal{Objects: 2, Bytes: 8}) {
+	if len(progress.started) != 1 || progress.started[0] != (ProgressTotal{}) {
 		t.Fatalf("start = %#v", progress.started)
 	}
 	if len(progress.advanced) != 2 || progress.advanced[0] != (ProgressTotal{Objects: 1, Bytes: 3}) || progress.advanced[1] != (ProgressTotal{Objects: 1, Bytes: 5}) {
@@ -107,8 +152,8 @@ func TestDeleteSelectedPrefixesReportsConfirmedProgressBeforeIndividualFailure(t
 		{
 			name: "confirmed bulk delete before individual failure",
 			objects: []types.Object{
-				{Key: aws.String("p/ordinary"), Size: aws.Int64(10)},
 				{Key: aws.String("p/control\x01"), Size: aws.Int64(20)},
+				{Key: aws.String("p/ordinary"), Size: aws.Int64(10)},
 			},
 			bulkOutput: &s3.DeleteObjectsOutput{Deleted: []types.DeletedObject{{Key: aws.String("p/ordinary")}}},
 			singleErrs: []error{requestErr},
@@ -126,8 +171,8 @@ func TestDeleteSelectedPrefixesReportsConfirmedProgressBeforeIndividualFailure(t
 		{
 			name: "unacknowledged bulk delete is not counted without verification",
 			objects: []types.Object{
-				{Key: aws.String("p/ordinary"), Size: aws.Int64(10)},
 				{Key: aws.String("p/control\x01"), Size: aws.Int64(20)},
+				{Key: aws.String("p/ordinary"), Size: aws.Int64(10)},
 			},
 			bulkOutput: &s3.DeleteObjectsOutput{},
 			singleErrs: []error{requestErr},
@@ -152,9 +197,12 @@ func TestDeleteSelectedPrefixesReportsConfirmedProgressBeforeIndividualFailure(t
 			if summary.Deleted != test.want.Objects || summary.DeletedBytes != test.want.Bytes {
 				t.Fatalf("summary = %#v, want confirmed work %#v", summary, test.want)
 			}
-			want := fmt.Sprintf("deleted %d/%d objects", test.want.Objects, len(test.objects))
+			want := fmt.Sprintf("deleted %d objects", test.want.Objects)
 			if !strings.Contains(output.String(), want) {
 				t.Fatalf("final progress = %q, want %q", output.String(), want)
+			}
+			if !strings.Contains(output.String(), "total unknown (inventory in progress)") {
+				t.Fatalf("final progress = %q, want unknown total after early failure", output.String())
 			}
 			want = fmt.Sprintf("%d objects (%s)", stats.Objects-int64(test.want.Objects), formatBytes(stats.Bytes-test.want.Bytes))
 			if !strings.Contains(output.String(), "bucket remainder estimate from snapshot") || !strings.Contains(output.String(), want) {
@@ -392,6 +440,77 @@ func TestProgressRendererTransitionsToDeletion(t *testing.T) {
 	final := readProgressContaining(t, output.lines, "deleted 1/2 objects")
 	if !strings.Contains(final, "deleted 1/2 objects") || !strings.Contains(final, "progress [######......] 50%") {
 		t.Fatalf("final status = %q", final)
+	}
+}
+
+func TestProgressRendererStreamingTransitionsToExactTotal(t *testing.T) {
+	output := channelProgressWriter{lines: make(chan string, 256)}
+	renderer := NewProgressRenderer(output, false)
+	renderer.SetPhase("inventorying and deleting")
+	renderer.StartStreaming(context.Background())
+	initial := readProgressLine(t, output.lines)
+	if !strings.Contains(initial, "total unknown (inventory in progress)") {
+		t.Fatalf("initial progress = %q", initial)
+	}
+
+	renderer.Discover(ProgressTotal{Objects: 3, Bytes: 30})
+	renderer.Advance(ProgressTotal{Objects: 1, Bytes: 10})
+	renderer.SetPhase("deleting while inventory continues")
+	streaming := readProgressContaining(t, output.lines, "status: deleting while inventory continues")
+	for _, want := range []string{"deleted 1 objects (10 B)", "discovered 3 objects (30 B)", "known pending 2 objects (20 B)", "ETA unknown"} {
+		if !strings.Contains(streaming, want) {
+			t.Fatalf("streaming progress = %q, missing %q", streaming, want)
+		}
+	}
+	if strings.Contains(streaming, "progress [") || strings.Contains(streaming, "%") {
+		t.Fatalf("streaming progress claims an exact percentage: %q", streaming)
+	}
+
+	renderer.CompleteDiscovery()
+	exact := readProgressContaining(t, output.lines, "deleted 1/3 objects")
+	if !strings.Contains(exact, "remaining 2 objects (20 B)") || !strings.Contains(exact, "progress [####........] 33%") {
+		t.Fatalf("exact progress = %q", exact)
+	}
+	renderer.Discover(ProgressTotal{Objects: 1, Bytes: 10})
+	renderer.Advance(ProgressTotal{Objects: 2, Bytes: 20})
+	renderer.Finish()
+	final := readProgressContaining(t, output.lines, "deleted 3/3 objects")
+	if !strings.Contains(final, "progress [############] 100%") {
+		t.Fatalf("final progress = %q", final)
+	}
+}
+
+func TestProgressRendererConcurrentStreamingUpdates(t *testing.T) {
+	var output bytes.Buffer
+	renderer := NewProgressRenderer(&output, false)
+	renderer.StartStreaming(context.Background())
+	const workers = 10
+	const updates = 100
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range updates {
+				renderer.Discover(ProgressTotal{Objects: 1, Bytes: 2})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range updates {
+				renderer.Advance(ProgressTotal{Objects: 1, Bytes: 2})
+			}
+		}()
+	}
+	wg.Wait()
+	renderer.CompleteDiscovery()
+	renderer.Finish()
+	want := ProgressTotal{Objects: workers * updates, Bytes: workers * updates * 2}
+	if renderer.total != want || renderer.confirmed != want {
+		t.Fatalf("totals = %#v, confirmed = %#v, want %#v", renderer.total, renderer.confirmed, want)
+	}
+	if !strings.Contains(output.String(), "progress [############] 100%") {
+		t.Fatalf("final progress = %q", output.String())
 	}
 }
 

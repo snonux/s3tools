@@ -24,7 +24,7 @@ func TestDeletePrefixPreservesListingKeysAcrossBulkAndIndividualDeletes(t *testi
 				t.Errorf("encoding-type = %q, want url", got)
 			}
 			if listRequests == 1 {
-				return listingResponse(`<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>` + bulkKeyEncoded + `</Key><Size>4</Size></Contents><Contents><Key>p/control%01.dat</Key><Size>6</Size></Contents></ListBucketResult>`), nil
+				return listingResponse(`<ListBucketResult><EncodingType>url</EncodingType><Contents><Key>p/control%01.dat</Key><Size>6</Size></Contents><Contents><Key>` + bulkKeyEncoded + `</Key><Size>4</Size></Contents></ListBucketResult>`), nil
 			}
 			return listingResponse(`<ListBucketResult><EncodingType>url</EncodingType></ListBucketResult>`), nil
 		}
@@ -107,8 +107,8 @@ func TestDeletePrefixPreservesVersionIDForXMLIncompatibleKey(t *testing.T) {
 	if summary.Deleted != 1 || summary.DeletedBytes != 8 {
 		t.Errorf("DeletePrefix() summary = %#v, want 1 object / 8 bytes", summary)
 	}
-	if listRequests != 2 || deleteRequests != 1 {
-		t.Errorf("requests: lists=%d individual deletes=%d, want 2/1", listRequests, deleteRequests)
+	if listRequests != 3 || deleteRequests != 1 {
+		t.Errorf("requests: lists=%d individual deletes=%d, want 3/1", listRequests, deleteRequests)
 	}
 	if xml10SafeValue(controlKey) {
 		t.Fatal("test control key unexpectedly passed XML 1.0 validation")

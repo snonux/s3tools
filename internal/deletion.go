@@ -2,7 +2,6 @@ package internal
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -60,143 +59,16 @@ func DeletePrefix(ctx context.Context, client ObjectDeleter, bucket, prefix stri
 	return DeletePrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, nil)
 }
 
-// DeletePrefixWithProgress deletes one prefix and reports its pre-deletion
-// inventory and each batch S3 confirms.
+// DeletePrefixWithProgress deletes one prefix while listing it, and reports
+// discovered and confirmed deletion work.
 func DeletePrefixWithProgress(ctx context.Context, client ObjectDeleter, bucket, prefix string, versioning Versioning, exclusions []string, progress ProgressObserver) (DeleteSummary, error) {
-	if err := ctx.Err(); err != nil {
-		return DeleteSummary{}, &PartialDeleteError{Cause: err}
-	}
-	setProgressPhase(progress, fmt.Sprintf("inventorying prefix %q (1/1)", prefix))
-	inventory, err := InventoryPrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, func(scanned InventoryProgress) {
-		setProgressPhaseQuiet(progress, fmt.Sprintf("inventorying prefix %q (1/1): %d pages, %d objects (%s) scanned; total pending", prefix, scanned.Pages, scanned.Objects, formatBytes(scanned.Bytes)))
-	})
-	if err != nil {
-		setProgressPhase(progress, "deletion stopped")
-		return DeleteSummary{}, err
-	}
-	if progress != nil {
-		progress.Start(ctx, ProgressTotal{Objects: len(inventory.Entries), Bytes: inventory.Bytes})
-		defer progress.Finish()
-	}
-
-	summary, err := deleteInventory(ctx, client, bucket, prefix, inventory, versioning, exclusions, progress)
-	if err != nil {
-		setProgressPhase(progress, "deletion stopped")
-	} else {
-		setProgressPhase(progress, "deletion complete")
-	}
-	return summary, err
+	return deleteSelectedStreaming(ctx, client, bucket, []string{prefix}, versioning, exclusions, progress)
 }
 
-// DeleteSelectedPrefixes inventories all selected prefixes before deletion,
-// then reports a single progress stream across the selected work.
+// DeleteSelectedPrefixes lists and deletes selected prefixes with bounded work
+// in flight, then verifies each prefix is empty of eligible entries.
 func DeleteSelectedPrefixes(ctx context.Context, client ObjectDeleter, bucket string, prefixes []string, versioning Versioning, exclusions []string, progress ProgressObserver) (DeleteSummary, error) {
-	if err := ctx.Err(); err != nil {
-		return DeleteSummary{}, &PartialDeleteError{Cause: err}
-	}
-	inventories := make([]Inventory, len(prefixes))
-	total := ProgressTotal{}
-	for index, prefix := range prefixes {
-		setProgressPhase(progress, fmt.Sprintf("inventorying prefix %q (%d/%d); completed %d objects (%s)", prefix, index+1, len(prefixes), total.Objects, formatBytes(total.Bytes)))
-		inventory, err := InventoryPrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, func(scanned InventoryProgress) {
-			setProgressPhaseQuiet(progress, fmt.Sprintf("inventorying prefix %q (%d/%d): %d pages, %d objects (%s) scanned here; %d objects (%s) in earlier prefixes; total pending", prefix, index+1, len(prefixes), scanned.Pages, scanned.Objects, formatBytes(scanned.Bytes), total.Objects, formatBytes(total.Bytes)))
-		})
-		if err != nil {
-			setProgressPhase(progress, "deletion stopped")
-			return DeleteSummary{}, err
-		}
-		inventories[index] = inventory
-		total.Objects += len(inventory.Entries)
-		total.Bytes += inventory.Bytes
-	}
-	if progress != nil {
-		progress.Start(ctx, total)
-		defer progress.Finish()
-	}
-
-	summary := DeleteSummary{}
-	for index, prefix := range prefixes {
-		deleted, err := deleteInventory(ctx, client, bucket, prefix, inventories[index], versioning, exclusions, progress)
-		summary.Deleted += deleted.Deleted
-		summary.DeletedBytes += deleted.DeletedBytes
-		summary.Failures = append(summary.Failures, deleted.Failures...)
-		if err != nil {
-			setProgressPhase(progress, "deletion stopped")
-			var partial *PartialDeleteError
-			if errors.As(err, &partial) && partial != nil {
-				partial.Summary = summary
-			}
-			return summary, err
-		}
-	}
-	setProgressPhase(progress, "deletion complete")
-
-	return summary, nil
-}
-
-func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix string, inventory Inventory, versioning Versioning, exclusions []string, progress ProgressObserver) (DeleteSummary, error) {
-
-	summary := DeleteSummary{}
-	unacknowledged := make([]ObjectEntry, 0)
-	for start := 0; start < len(inventory.Entries); start += deleteBatchSize {
-		if err := ctx.Err(); err != nil {
-			return summary, &PartialDeleteError{Summary: summary, Cause: err}
-		}
-		end := start + deleteBatchSize
-		if end > len(inventory.Entries) {
-			end = len(inventory.Entries)
-		}
-		setProgressPhase(progress, fmt.Sprintf("deleting prefix %q, batch %d/%d", prefix, start/deleteBatchSize+1, (len(inventory.Entries)+deleteBatchSize-1)/deleteBatchSize))
-		before := summary
-		pending, err := deleteBatch(ctx, client, bucket, inventory.Entries[start:end], versioning, &summary)
-		// A mixed batch can confirm deletions before an individual request
-		// fails. Publish that work before returning the partial failure.
-		if progress != nil {
-			progress.Advance(ProgressTotal{Objects: summary.Deleted - before.Deleted, Bytes: summary.DeletedBytes - before.DeletedBytes})
-		}
-		if err != nil {
-			return summary, &PartialDeleteError{Summary: summary, Cause: err}
-		}
-		unacknowledged = append(unacknowledged, pending...)
-	}
-
-	if err := ctx.Err(); err != nil {
-		return summary, &PartialDeleteError{Summary: summary, Cause: err}
-	}
-	setProgressPhase(progress, fmt.Sprintf("verifying prefix %q", prefix))
-	remaining, err := InventoryPrefixWithProgress(ctx, client, bucket, prefix, versioning, exclusions, func(scanned InventoryProgress) {
-		setProgressPhaseQuiet(progress, fmt.Sprintf("verifying prefix %q: %d pages, %d objects scanned", prefix, scanned.Pages, scanned.Objects))
-	})
-	if err != nil {
-		return summary, &PartialDeleteError{Summary: summary, Cause: fmt.Errorf("verify deletion: %w", err)}
-	}
-	remainingKeys := make(map[string]struct{}, len(remaining.Entries))
-	for _, entry := range remaining.Entries {
-		remainingKeys[entry.Key] = struct{}{}
-	}
-	verified := ProgressTotal{}
-	for _, entry := range unacknowledged {
-		if _, remains := remainingKeys[entry.Key]; remains {
-			summary.Failures = append(summary.Failures, DeleteFailure{Key: entry.Key, Code: "Unconfirmed", Message: "S3 did not acknowledge deletion and the object remains"})
-			continue
-		}
-		summary.Deleted++
-		summary.DeletedBytes += entry.Size
-		verified.Objects++
-		verified.Bytes += entry.Size
-	}
-	if progress != nil && verified != (ProgressTotal{}) {
-		progress.Advance(verified)
-	}
-
-	if len(summary.Failures) != 0 || len(remaining.Entries) != 0 {
-		cause := error(nil)
-		if len(remaining.Entries) != 0 {
-			cause = fmt.Errorf("%d eligible objects remain", len(remaining.Entries))
-		}
-		return summary, &PartialDeleteError{Summary: summary, Cause: cause}
-	}
-	return summary, nil
+	return deleteSelectedStreaming(ctx, client, bucket, prefixes, versioning, exclusions, progress)
 }
 
 func setProgressPhase(progress ProgressObserver, phase string) {

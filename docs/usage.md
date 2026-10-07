@@ -91,15 +91,21 @@ s3rm -exclude keep/ -exclude legal/hold.txt \
 
 `s3rm` reports its current phase immediately and refreshes status every two
 seconds, including while an S3 request is waiting. This covers connection,
-bucket discovery, optional bucket statistics, inventory, deletion, and final
-verification. Discovery shows completed pages and prefixes found. Inventory
-status shows completed pages and objects scanned; its
-total remains unknown until listing finishes. During deletion, status includes
-a progress bar, confirmed object and byte counts, remaining work, throughput,
-elapsed time, and an ETA. The final status says `deletion complete` once
-verification succeeds. A terminal updates one line; redirected output emits
-timestamped log lines. Interactive selection prompts pause status output until
-the bucket name has been confirmed.
+bucket discovery, optional bucket statistics, streaming deletion, and final
+verification. Discovery shows completed pages and prefixes found. Deletion
+starts as soon as listing finds eligible objects, with a bounded number of
+pages queued while listing continues. Status shows discovered, deleted, and
+known pending objects and bytes. The exact total is unknown until listing
+finishes, so the progress bar and ETA appear only then. The final status says
+`deletion complete` once verification succeeds. A terminal updates one line;
+redirected output emits timestamped log lines. Interactive selection prompts
+pause status output until the bucket name has been confirmed.
+
+For unversioned buckets, listing and deletion run concurrently using a key
+cursor. Versioned buckets delete one page before listing the next so version
+markers cannot become invalid. Both modes verify the selected prefixes after
+deletion. If another client keeps writing to a prefix, verification can report
+remaining objects and the command exits with an error.
 
 Use `--bucket-stats` in either interactive or batch mode to scan the whole
 bucket before deletion:

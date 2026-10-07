@@ -55,11 +55,22 @@ func (snapshot ProgressSnapshot) ETA() time.Duration {
 	return time.Duration(float64(remaining.Objects) / float64(snapshot.Rate.Objects) * float64(time.Second))
 }
 
-// ProgressObserver receives confirmed deletion accounting.
+// ProgressObserver receives confirmed deletion accounting. Streaming deletion
+// starts older observers with a zero total because the final count is unknown;
+// implementations that need discovered counts use StreamingProgressObserver.
 type ProgressObserver interface {
 	Start(context.Context, ProgressTotal)
 	Advance(ProgressTotal)
 	Finish()
+}
+
+// StreamingProgressObserver reports deletion while inventory is still growing.
+// Discover adds newly inventoried work; CompleteDiscovery marks the total exact.
+type StreamingProgressObserver interface {
+	ProgressObserver
+	StartStreaming(context.Context)
+	Discover(ProgressTotal)
+	CompleteDiscovery()
 }
 
 type progressSample struct {
@@ -78,6 +89,7 @@ type ProgressRenderer struct {
 	mu              sync.Mutex
 	begun           bool
 	started         bool
+	discoveryDone   bool
 	startTime       time.Time
 	phase           string
 	total           ProgressTotal
@@ -162,6 +174,7 @@ func (renderer *ProgressRenderer) Start(ctx context.Context, total ProgressTotal
 		return
 	}
 	renderer.started = true
+	renderer.discoveryDone = true
 	startLoop := !renderer.begun && !renderer.finishRequested
 	if !renderer.begun {
 		renderer.begun = true
@@ -184,11 +197,57 @@ func (renderer *ProgressRenderer) Start(ctx context.Context, total ProgressTotal
 	}
 }
 
+// StartStreaming begins deletion progress before the inventory total is known.
+func (renderer *ProgressRenderer) StartStreaming(ctx context.Context) {
+	renderer.mu.Lock()
+	if renderer.started || renderer.finishRequested {
+		renderer.mu.Unlock()
+		return
+	}
+	renderer.started = true
+	startLoop := !renderer.begun
+	if startLoop {
+		renderer.begun = true
+		renderer.startTime = renderer.now()
+		renderer.wg.Add(1)
+	}
+	renderer.samples = []progressSample{{at: renderer.now()}}
+	renderer.mu.Unlock()
+
+	renderer.render(false)
+	if startLoop {
+		go renderer.renderLoop(ctx)
+	}
+}
+
+// Discover adds eligible objects found by a concurrent inventory scan.
+func (renderer *ProgressRenderer) Discover(discovered ProgressTotal) {
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	if !renderer.started || renderer.discoveryDone || renderer.finishRequested {
+		return
+	}
+	renderer.total.Objects += discovered.Objects
+	renderer.total.Bytes += discovered.Bytes
+}
+
+// CompleteDiscovery marks the inventory total exact and shows the progress bar.
+func (renderer *ProgressRenderer) CompleteDiscovery() {
+	renderer.mu.Lock()
+	if !renderer.started || renderer.discoveryDone || renderer.finishRequested {
+		renderer.mu.Unlock()
+		return
+	}
+	renderer.discoveryDone = true
+	renderer.mu.Unlock()
+	renderer.render(false)
+}
+
 // Advance adds deletion work which S3 confirmed.
 func (renderer *ProgressRenderer) Advance(confirmed ProgressTotal) {
 	renderer.mu.Lock()
 	defer renderer.mu.Unlock()
-	if !renderer.started {
+	if !renderer.started || renderer.finishRequested {
 		return
 	}
 	renderer.confirmed.Objects += confirmed.Objects
@@ -243,7 +302,12 @@ func (renderer *ProgressRenderer) render(final bool) {
 	now := renderer.now()
 	line := formatPendingProgress(renderer.phase, now.Sub(renderer.startTime))
 	if renderer.started {
-		line = formatProgress(renderer.snapshotLocked(now))
+		snapshot := renderer.snapshotLocked(now)
+		if renderer.discoveryDone {
+			line = formatProgress(snapshot)
+		} else {
+			line = formatStreamingProgress(snapshot)
+		}
 		if renderer.phase != "" {
 			line = "status: " + renderer.phase + "; " + line
 		}
@@ -257,6 +321,23 @@ func (renderer *ProgressRenderer) render(final bool) {
 		return
 	}
 	_, _ = fmt.Fprintf(renderer.output, "%s %s\n", now.Format(time.RFC3339), line)
+}
+
+func formatStreamingProgress(snapshot ProgressSnapshot) string {
+	pending := snapshot.Remaining()
+	return fmt.Sprintf(
+		"deleted %d objects (%s); discovered %d objects (%s); known pending %d objects (%s); total unknown (inventory in progress); rate %s objects/s (%s/s); elapsed %s; ETA unknown%s",
+		snapshot.Confirmed.Objects,
+		formatBytes(snapshot.Confirmed.Bytes),
+		snapshot.Total.Objects,
+		formatBytes(snapshot.Total.Bytes),
+		pending.Objects,
+		formatBytes(pending.Bytes),
+		formatRate(snapshot.Rate.Objects),
+		formatByteRate(snapshot.Rate.Bytes),
+		formatDuration(snapshot.Elapsed),
+		formatBucketRemainder(snapshot.BucketStats, snapshot.Confirmed),
+	)
 }
 
 func formatPendingProgress(phase string, elapsed time.Duration) string {
@@ -380,3 +461,4 @@ func trimProgressSamples(samples []progressSample, now time.Time) []progressSamp
 }
 
 var _ ProgressObserver = (*ProgressRenderer)(nil)
+var _ StreamingProgressObserver = (*ProgressRenderer)(nil)
