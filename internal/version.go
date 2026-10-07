@@ -2,4 +2,4 @@
 package internal
 
 // Version is the s3rm release version.
-const Version = "0.1.2"
+const Version = "0.1.3"
