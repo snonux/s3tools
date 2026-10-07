@@ -13,14 +13,15 @@ import (
 
 // Config contains the S3 connection and deletion protection settings.
 type Config struct {
-	Bucket          string   `toml:"bucket"`
-	Region          string   `toml:"region"`
-	Endpoint        string   `toml:"endpoint"`
-	AccessKeyID     string   `toml:"access_key_id"`
-	SecretAccessKey string   `toml:"secret_access_key"`
-	SessionToken    string   `toml:"session_token"`
-	ForcePathStyle  bool     `toml:"force_path_style"`
-	Exclude         []string `toml:"exclude"`
+	Bucket              string   `toml:"bucket"`
+	Region              string   `toml:"region"`
+	Endpoint            string   `toml:"endpoint"`
+	AccessKeyID         string   `toml:"access_key_id"`
+	SecretAccessKey     string   `toml:"secret_access_key"`
+	SessionToken        string   `toml:"session_token"`
+	ForcePathStyle      bool     `toml:"force_path_style"`
+	UseVirtualHostStyle bool     `toml:"use_virtual_host_style"`
+	Exclude             []string `toml:"exclude"`
 }
 
 // LoadConfig loads connection settings and returns unconsumed application arguments.
@@ -54,6 +55,9 @@ func (config Config) Validate() error {
 	}
 	if (config.AccessKeyID == "") != (config.SecretAccessKey == "") {
 		return errors.New("access_key_id and secret_access_key must be set together")
+	}
+	if config.SessionToken != "" && config.AccessKeyID == "" {
+		return errors.New("session_token requires access_key_id and secret_access_key")
 	}
 
 	return nil

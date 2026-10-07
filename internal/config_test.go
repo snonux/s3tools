@@ -20,10 +20,10 @@ func TestLoadConfig(t *testing.T) {
 	}{
 		{
 			name:     "file config and CLI exclusions",
-			contents: "bucket = 'photos'\nregion = 'eu-west-1'\nendpoint = 'https://s3.example.test'\naccess_key_id = 'file-key'\nsecret_access_key = 'file-secret'\nforce_path_style = true\nexclude = ['keep/', 'root.txt']\n",
+			contents: "bucket = 'photos'\nregion = 'eu-west-1'\nendpoint = 'https://s3.example.test'\naccess_key_id = 'file-key'\nsecret_access_key = 'file-secret'\nforce_path_style = true\nuse_virtual_host_style = true\nexclude = ['keep/', 'root.txt']\n",
 			args:     []string{"-config", "CONFIG", "-exclude=logs/", "-prefix", "photos/"},
 			want: Config{
-				Bucket: "photos", Region: "eu-west-1", Endpoint: "https://s3.example.test", AccessKeyID: "file-key", SecretAccessKey: "file-secret", ForcePathStyle: true,
+				Bucket: "photos", Region: "eu-west-1", Endpoint: "https://s3.example.test", AccessKeyID: "file-key", SecretAccessKey: "file-secret", ForcePathStyle: true, UseVirtualHostStyle: true,
 				Exclude: []string{"keep/", "root.txt", "logs/"},
 			},
 			wantArgs: []string{"-prefix", "photos/"},
@@ -149,6 +149,7 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{name: "missing bucket", config: Config{Region: "garage"}, wantError: "bucket is required"},
 		{name: "missing region", config: Config{Bucket: "photos"}, wantError: "region is required"},
+		{name: "lone session token", config: Config{Bucket: "photos", Region: "garage", SessionToken: "token"}, wantError: "session_token requires"},
 		{name: "complete", config: Config{Bucket: "photos", Region: "garage"}},
 	}
 
