@@ -28,14 +28,14 @@ func TestRun(t *testing.T) {
 			wantOut: internal.Version + "\n",
 		},
 		{
-			name:    "delegates future config flag",
+			name:    "forwards future config flag to application",
 			args:    []string{"-config", "config.toml"},
-			wantErr: "unexpected positional arguments: [-config config.toml]",
+			wantErr: "read config",
 		},
 		{
-			name:    "delegates version with another argument",
+			name:    "does not treat version with another argument as version request",
 			args:    []string{"-version", "bucket"},
-			wantErr: "unexpected positional arguments: [-version bucket]",
+			wantErr: "bucket is required",
 		},
 	}
 

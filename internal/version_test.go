@@ -20,12 +20,12 @@ func TestRun(t *testing.T) {
 	}{
 		{
 			name: "no arguments",
-			want: "s3rm is not configured yet",
+			want: "bucket is required",
 		},
 		{
 			name: "positional arguments rejected",
 			args: []string{"bucket"},
-			want: "unexpected positional arguments: [bucket]",
+			want: "bucket is required",
 		},
 	}
 
