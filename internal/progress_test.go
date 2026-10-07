@@ -117,6 +117,81 @@ func TestProgressSnapshotKeepsFractionalRateAndETA(t *testing.T) {
 	}
 }
 
+func TestProgressRendererRateIncludesFirstBatchAfterIdle(t *testing.T) {
+	start := time.Date(2026, time.October, 7, 9, 0, 0, 0, time.UTC)
+	now := start
+	renderer := newProgressRenderer(&bytes.Buffer{}, false, func() time.Time { return now })
+	renderer.Start(context.Background(), ProgressTotal{Objects: 2000, Bytes: 20000})
+
+	now = start.Add(11 * time.Second)
+	renderer.Advance(ProgressTotal{Objects: 1000, Bytes: 10000})
+	now = start.Add(12 * time.Second)
+	snapshot := snapshotProgressAt(renderer, now)
+	renderer.Finish()
+
+	if snapshot.Rate.Objects != 1000.0/12.0 || snapshot.Rate.Bytes != 10000.0/12.0 {
+		t.Fatalf("Rate = %#v, want first batch included across 12s", snapshot.Rate)
+	}
+	if snapshot.ETA() != 12*time.Second {
+		t.Fatalf("ETA() = %s, want 12s", snapshot.ETA())
+	}
+}
+
+func TestProgressRendererRateUsesBaselineAcrossWindowBoundary(t *testing.T) {
+	start := time.Date(2026, time.October, 7, 9, 0, 0, 0, time.UTC)
+	now := start
+	renderer := newProgressRenderer(&bytes.Buffer{}, false, func() time.Time { return now })
+	renderer.Start(context.Background(), ProgressTotal{Objects: 2000, Bytes: 20000})
+
+	now = start.Add(time.Second)
+	renderer.Advance(ProgressTotal{Objects: 100, Bytes: 1000})
+	now = start.Add(6 * time.Second)
+	renderer.Advance(ProgressTotal{Objects: 600, Bytes: 6000})
+	now = start.Add(11 * time.Second)
+	renderer.Advance(ProgressTotal{Objects: 400, Bytes: 4000})
+	now = start.Add(12 * time.Second)
+	snapshot := snapshotProgressAt(renderer, now)
+	renderer.Finish()
+
+	if snapshot.Rate.Objects != 1000.0/11.0 || snapshot.Rate.Bytes != 10000.0/11.0 {
+		t.Fatalf("Rate = %#v, want batches after the retained baseline averaged over 11s", snapshot.Rate)
+	}
+	if got, want := snapshot.ETA(), time.Duration(float64(time.Second)*900.0/1000.0*11); got != want {
+		t.Fatalf("ETA() = %s, want %s", got, want)
+	}
+}
+
+func TestProgressRendererRateDecaysToZeroWhenIdle(t *testing.T) {
+	start := time.Date(2026, time.October, 7, 9, 0, 0, 0, time.UTC)
+	now := start
+	renderer := newProgressRenderer(&bytes.Buffer{}, false, func() time.Time { return now })
+	renderer.Start(context.Background(), ProgressTotal{Objects: 200})
+
+	now = start.Add(11 * time.Second)
+	renderer.Advance(ProgressTotal{Objects: 100})
+	now = start.Add(12 * time.Second)
+	active := snapshotProgressAt(renderer, now)
+	now = start.Add(22 * time.Second)
+	idle := snapshotProgressAt(renderer, now)
+	renderer.Finish()
+
+	if active.Rate.Objects <= 0 {
+		t.Fatalf("active rate = %v, want positive rate", active.Rate.Objects)
+	}
+	if idle.Rate != (ProgressRate{}) {
+		t.Fatalf("idle rate = %#v, want zero after the batch leaves the window", idle.Rate)
+	}
+	if idle.ETA() != 0 {
+		t.Fatalf("idle ETA() = %s, want zero for unknown ETA", idle.ETA())
+	}
+}
+
+func snapshotProgressAt(renderer *ProgressRenderer, now time.Time) ProgressSnapshot {
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	return renderer.snapshotLocked(now)
+}
+
 func TestProgressRendererTerminalAndLogOutput(t *testing.T) {
 	now := time.Date(2026, time.October, 7, 9, 0, 0, 0, time.UTC)
 	tests := []struct {

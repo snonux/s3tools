@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const progressInterval = 2 * time.Second
+const (
+	progressInterval   = 2 * time.Second
+	progressRateWindow = 10 * time.Second
+)
 
 // ProgressTotal identifies the selected deletion work.
 type ProgressTotal struct {
@@ -123,8 +126,9 @@ func (renderer *ProgressRenderer) Advance(confirmed ProgressTotal) {
 	}
 	renderer.confirmed.Objects += confirmed.Objects
 	renderer.confirmed.Bytes += confirmed.Bytes
-	renderer.samples = append(renderer.samples, progressSample{at: renderer.now(), confirmed: renderer.confirmed})
-	renderer.samples = trimProgressSamples(renderer.samples, renderer.now())
+	now := renderer.now()
+	renderer.samples = append(renderer.samples, progressSample{at: now, confirmed: renderer.confirmed})
+	renderer.samples = trimProgressSamples(renderer.samples, now)
 }
 
 // Finish stops progress reporting and renders its final state.
@@ -190,17 +194,20 @@ func (renderer *ProgressRenderer) snapshotLocked(now time.Time) ProgressSnapshot
 	elapsed := now.Sub(renderer.startTime)
 	rate := ProgressRate{}
 	if len(renderer.samples) > 1 {
-		first := renderer.samples[0]
-		for _, sample := range renderer.samples {
-			if now.Sub(sample.at) <= 10*time.Second {
-				first = sample
-				break
+		last := renderer.samples[len(renderer.samples)-1]
+		if now.Sub(last.at) <= progressRateWindow {
+			baseline := renderer.samples[0]
+			for index := 1; index < len(renderer.samples); index++ {
+				if now.Sub(renderer.samples[index].at) <= progressRateWindow {
+					baseline = renderer.samples[index-1]
+					break
+				}
 			}
-		}
-		period := now.Sub(first.at)
-		if period > 0 {
-			rate.Objects = float64(renderer.confirmed.Objects-first.confirmed.Objects) / period.Seconds()
-			rate.Bytes = float64(renderer.confirmed.Bytes-first.confirmed.Bytes) / period.Seconds()
+			period := now.Sub(baseline.at)
+			if period > 0 {
+				rate.Objects = float64(renderer.confirmed.Objects-baseline.confirmed.Objects) / period.Seconds()
+				rate.Bytes = float64(renderer.confirmed.Bytes-baseline.confirmed.Bytes) / period.Seconds()
+			}
 		}
 	}
 	return ProgressSnapshot{Total: renderer.total, Confirmed: renderer.confirmed, Elapsed: elapsed, Rate: rate}
@@ -262,7 +269,7 @@ func formatDuration(duration time.Duration) string {
 
 func trimProgressSamples(samples []progressSample, now time.Time) []progressSample {
 	start := 0
-	for start < len(samples)-1 && now.Sub(samples[start+1].at) > 10*time.Second {
+	for start < len(samples)-1 && now.Sub(samples[start+1].at) > progressRateWindow {
 		start++
 	}
 	return samples[start:]
