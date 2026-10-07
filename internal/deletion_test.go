@@ -13,6 +13,7 @@ import (
 type fakeDeleter struct {
 	versionPages  []*s3.ListObjectVersionsOutput
 	objectPages   []*s3.ListObjectsV2Output
+	objectErrors  []error
 	deleteOutputs []*s3.DeleteObjectsOutput
 	deleteErr     error
 	deleteInputs  []*s3.DeleteObjectsInput
@@ -25,6 +26,13 @@ func (client *fakeDeleter) ListObjectVersions(_ context.Context, _ *s3.ListObjec
 }
 
 func (client *fakeDeleter) ListObjectsV2(_ context.Context, _ *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	if len(client.objectErrors) > 0 {
+		err := client.objectErrors[0]
+		client.objectErrors = client.objectErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	page := client.objectPages[0]
 	client.objectPages = client.objectPages[1:]
 	return page, nil
@@ -121,7 +129,7 @@ func TestDeletePrefixCancellationAndVersionlessFailure(t *testing.T) {
 	}
 }
 
-func TestDeletePrefixRequiresSuccessAcknowledgement(t *testing.T) {
+func TestDeletePrefixAcceptsUnversionedGatewayWithoutDeleteAcknowledgement(t *testing.T) {
 	client := &fakeDeleter{
 		objectPages: []*s3.ListObjectsV2Output{
 			{Contents: []types.Object{{Key: aws.String("p/a"), Size: aws.Int64(2)}}},
@@ -130,7 +138,33 @@ func TestDeletePrefixRequiresSuccessAcknowledgement(t *testing.T) {
 		deleteOutputs: []*s3.DeleteObjectsOutput{{}},
 	}
 	summary, err := DeletePrefix(context.Background(), client, "bucket", "p/", Unversioned, nil)
-	if err == nil || len(summary.Failures) != 1 || summary.Failures[0].Code != "Unconfirmed" {
+	if err != nil || summary.Deleted != 1 || summary.DeletedBytes != 2 {
+		t.Fatalf("summary = %#v, error = %v", summary, err)
+	}
+}
+
+func TestDeletePrefixDoesNotCountUnacknowledgedDeleteWhenVerificationFails(t *testing.T) {
+	client := &fakeDeleter{
+		objectPages:   []*s3.ListObjectsV2Output{{Contents: []types.Object{{Key: aws.String("p/a"), Size: aws.Int64(2)}}}},
+		objectErrors:  []error{nil, errors.New("listing unavailable")},
+		deleteOutputs: []*s3.DeleteObjectsOutput{{}},
+	}
+	summary, err := DeletePrefix(context.Background(), client, "bucket", "p/", Unversioned, nil)
+	if err == nil || summary.Deleted != 0 || summary.DeletedBytes != 0 {
+		t.Fatalf("summary = %#v, error = %v", summary, err)
+	}
+}
+
+func TestDeletePrefixCountsVerifiedUnacknowledgedDeleteWithOtherFailure(t *testing.T) {
+	client := &fakeDeleter{
+		objectPages: []*s3.ListObjectsV2Output{
+			{Contents: []types.Object{{Key: aws.String("p/a"), Size: aws.Int64(2)}, {Key: aws.String("p/b"), Size: aws.Int64(3)}}},
+			{Contents: []types.Object{{Key: aws.String("p/a"), Size: aws.Int64(2)}}},
+		},
+		deleteOutputs: []*s3.DeleteObjectsOutput{{Errors: []types.Error{{Key: aws.String("p/a"), Code: aws.String("AccessDenied")}}}},
+	}
+	summary, err := DeletePrefix(context.Background(), client, "bucket", "p/", Unversioned, nil)
+	if err == nil || summary.Deleted != 1 || summary.DeletedBytes != 3 || !hasFailure(summary.Failures, "p/a", "") {
 		t.Fatalf("summary = %#v, error = %v", summary, err)
 	}
 }

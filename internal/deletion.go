@@ -112,6 +112,7 @@ func DeleteSelectedPrefixes(ctx context.Context, client ObjectDeleter, bucket st
 func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix string, inventory Inventory, versioning Versioning, exclusions []string, progress ProgressObserver) (DeleteSummary, error) {
 
 	summary := DeleteSummary{}
+	unacknowledged := make([]ObjectEntry, 0)
 	for start := 0; start < len(inventory.Entries); start += deleteBatchSize {
 		if err := ctx.Err(); err != nil {
 			return summary, &PartialDeleteError{Summary: summary, Cause: err}
@@ -121,9 +122,11 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 			end = len(inventory.Entries)
 		}
 		before := summary
-		if err := deleteBatch(ctx, client, bucket, inventory.Entries[start:end], versioning, &summary); err != nil {
+		pending, err := deleteBatch(ctx, client, bucket, inventory.Entries[start:end], versioning, &summary)
+		if err != nil {
 			return summary, &PartialDeleteError{Summary: summary, Cause: err}
 		}
+		unacknowledged = append(unacknowledged, pending...)
 		if progress != nil {
 			progress.Advance(ProgressTotal{Objects: summary.Deleted - before.Deleted, Bytes: summary.DeletedBytes - before.DeletedBytes})
 		}
@@ -136,6 +139,25 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 	if err != nil {
 		return summary, &PartialDeleteError{Summary: summary, Cause: fmt.Errorf("verify deletion: %w", err)}
 	}
+	remainingKeys := make(map[string]struct{}, len(remaining.Entries))
+	for _, entry := range remaining.Entries {
+		remainingKeys[entry.Key] = struct{}{}
+	}
+	verified := ProgressTotal{}
+	for _, entry := range unacknowledged {
+		if _, remains := remainingKeys[entry.Key]; remains {
+			summary.Failures = append(summary.Failures, DeleteFailure{Key: entry.Key, Code: "Unconfirmed", Message: "S3 did not acknowledge deletion and the object remains"})
+			continue
+		}
+		summary.Deleted++
+		summary.DeletedBytes += entry.Size
+		verified.Objects++
+		verified.Bytes += entry.Size
+	}
+	if progress != nil && verified != (ProgressTotal{}) {
+		progress.Advance(verified)
+	}
+
 	if len(summary.Failures) != 0 || len(remaining.Entries) != 0 {
 		cause := error(nil)
 		if len(remaining.Entries) != 0 {
@@ -143,11 +165,10 @@ func deleteInventory(ctx context.Context, client ObjectDeleter, bucket, prefix s
 		}
 		return summary, &PartialDeleteError{Summary: summary, Cause: cause}
 	}
-
 	return summary, nil
 }
 
-func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entries []ObjectEntry, versioning Versioning, summary *DeleteSummary) error {
+func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entries []ObjectEntry, versioning Versioning, summary *DeleteSummary) ([]ObjectEntry, error) {
 	objects := make([]types.ObjectIdentifier, 0, len(entries))
 	for _, entry := range entries {
 		object := types.ObjectIdentifier{Key: aws.String(entry.Key)}
@@ -159,10 +180,10 @@ func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entri
 
 	result, err := client.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: aws.String(bucket), Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(false)}})
 	if err != nil {
-		return fmt.Errorf("delete batch: %w", err)
+		return nil, fmt.Errorf("delete batch: %w", err)
 	}
 	if result == nil {
-		return fmt.Errorf("delete batch: empty response")
+		return nil, fmt.Errorf("delete batch: empty response")
 	}
 
 	failed := make(map[string]struct{}, len(result.Errors))
@@ -188,6 +209,7 @@ func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entri
 		failed[deletionKey(key, versionID)] = struct{}{}
 		summary.Failures = append(summary.Failures, failureInfo)
 	}
+	unacknowledged := make([]ObjectEntry, 0)
 	for _, entry := range entries {
 		_, failedByID := failed[deletionKey(entry.Key, entry.VersionID)]
 		_, failedByKey := failedKeys[entry.Key]
@@ -203,12 +225,17 @@ func deleteBatch(ctx context.Context, client ObjectDeleter, bucket string, entri
 			failure := unknownVersionFailures[entry.Key]
 			failure.VersionID = entry.VersionID
 			summary.Failures = append(summary.Failures, failure)
+		} else if versioning == Unversioned {
+			// Some compatible S3 gateways (including Garage) omit successful
+			// entries from the multi-delete response. The final inventory is the
+			// authoritative success check for these objects.
+			unacknowledged = append(unacknowledged, entry)
 		} else {
 			summary.Failures = append(summary.Failures, DeleteFailure{Key: entry.Key, VersionID: entry.VersionID, Code: "Unconfirmed", Message: "S3 did not acknowledge deletion"})
 		}
 	}
 
-	return nil
+	return unacknowledged, nil
 }
 
 func deletionKey(key, versionID string) string { return key + "\x00" + versionID }
