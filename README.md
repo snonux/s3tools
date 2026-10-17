@@ -22,6 +22,12 @@ For automation, require an explicit prefix and matching bucket confirmation:
 s3rm --prefix=old-exports/ --confirm-bucket=photos
 ```
 
+Preview eligible object counts and bytes without deleting anything:
+
+```sh
+s3rm --dry-run --prefix=old-exports/
+```
+
 See the [usage guide](docs/usage.md) for configuration, exclusions, Docker,
 progress reporting, and non-interactive examples.
 

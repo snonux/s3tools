@@ -54,6 +54,8 @@ func TestParseBatchArgs(t *testing.T) {
 		{name: "missing prefix value", args: []string{"--prefix", "--confirm-bucket", "photos"}, wantError: "--prefix requires a value"},
 		{name: "missing confirmation value", args: []string{"--confirm-bucket="}, wantError: "--confirm-bucket requires a value"},
 		{name: "duplicate confirmation", args: []string{"--confirm-bucket", "photos", "--confirm-bucket", "photos"}, wantError: "may only be specified once"},
+		{name: "dry run", args: []string{"--dry-run", "--prefix=images/"}, want: BatchRequest{DryRun: true, Prefixes: []string{"images/"}}},
+		{name: "single dash dry run", args: []string{"-dry-run"}, want: BatchRequest{DryRun: true}},
 		{name: "bucket statistics options", args: []string{"--bucket-stats", "--bucket-stats-pages", "12", "--bucket-stats-timeout=3s"}, want: BatchRequest{BucketStats: true, BucketStatsOptions: BucketStatsOptions{MaxPages: 12, Timeout: 3 * time.Second}}},
 		{name: "invalid bucket statistics page limit", args: []string{"--bucket-stats-pages=0"}, wantError: "positive integer"},
 		{name: "bucket statistics bounds require opt in", args: []string{"--bucket-stats-pages=12"}, wantError: "require --bucket-stats"},
@@ -70,7 +72,7 @@ func TestParseBatchArgs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.ConfirmedBucket != test.want.ConfirmedBucket || got.BucketStats != test.want.BucketStats || got.BucketStatsOptions != test.want.BucketStatsOptions || strings.Join(got.Prefixes, ",") != strings.Join(test.want.Prefixes, ",") || strings.Join(remaining, ",") != strings.Join(test.wantRemain, ",") {
+			if got.ConfirmedBucket != test.want.ConfirmedBucket || got.DryRun != test.want.DryRun || got.BucketStats != test.want.BucketStats || got.BucketStatsOptions != test.want.BucketStatsOptions || strings.Join(got.Prefixes, ",") != strings.Join(test.want.Prefixes, ",") || strings.Join(remaining, ",") != strings.Join(test.wantRemain, ",") {
 				t.Fatalf("ParseBatchArgs() = %#v, %#v; want %#v, %#v", got, remaining, test.want, test.wantRemain)
 			}
 		})
@@ -92,6 +94,11 @@ func TestValidateBatchRequest(t *testing.T) {
 		{name: "nonexistent target", request: BatchRequest{Prefixes: []string{"missing/"}, ConfirmedBucket: "photos"}, want: "does not exist"},
 		{name: "duplicate target", request: BatchRequest{Prefixes: []string{"images/", "images/"}, ConfirmedBucket: "photos"}, want: "selected more than once"},
 		{name: "valid targets", request: BatchRequest{Prefixes: []string{"images/", "logs/"}, ConfirmedBucket: "photos"}},
+		{name: "dry run needs no confirmation", request: BatchRequest{Prefixes: []string{"images/"}, DryRun: true}},
+		{name: "dry run rejects wrong confirmation", request: BatchRequest{Prefixes: []string{"images/"}, DryRun: true, ConfirmedBucket: "other"}, want: "does not exactly match"},
+		{name: "dry run requires prefix", request: BatchRequest{DryRun: true}, want: "at least one --prefix"},
+		{name: "dry run rejects protected target", request: BatchRequest{Prefixes: []string{"private/"}, DryRun: true}, want: "fully protected"},
+		{name: "dry run rejects missing target", request: BatchRequest{Prefixes: []string{"missing/"}, DryRun: true}, want: "does not exist"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

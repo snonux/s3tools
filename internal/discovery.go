@@ -65,17 +65,35 @@ func InventoryPrefix(ctx context.Context, client ObjectLister, bucket, prefix st
 
 // InventoryPrefixWithProgress inventories a prefix and reports each completed page.
 func InventoryPrefixWithProgress(ctx context.Context, client ObjectLister, bucket, prefix string, versioning Versioning, exclusions []string, onPage func(InventoryProgress)) (Inventory, error) {
-	if err := validatePrefix(prefix); err != nil {
+	inventory := Inventory{}
+	pages := 0
+	err := walkPrefixInventory(ctx, client, bucket, prefix, versioning, exclusions, func(page Inventory) error {
+		inventory.Entries = append(inventory.Entries, page.Entries...)
+		inventory.Bytes += page.Bytes
+		pages++
+		if onPage != nil {
+			onPage(InventoryProgress{Pages: pages, Objects: len(inventory.Entries), Bytes: inventory.Bytes})
+		}
+		return nil
+	})
+	if err != nil {
 		return Inventory{}, err
 	}
+	return inventory, nil
+}
+
+// walkPrefixInventory visits one listing page at a time without retaining prior pages.
+func walkPrefixInventory(ctx context.Context, client ObjectLister, bucket, prefix string, versioning Versioning, exclusions []string, visit func(Inventory) error) error {
+	if err := validatePrefix(prefix); err != nil {
+		return err
+	}
 	if IsExcluded(prefix, exclusions) {
-		return Inventory{}, fmt.Errorf("prefix %q is protected by an exclusion", prefix)
+		return fmt.Errorf("prefix %q is protected by an exclusion", prefix)
 	}
 	if versioning == Versioned {
-		return inventoryVersions(ctx, client, bucket, prefix, exclusions, onPage)
+		return walkVersions(ctx, client, bucket, prefix, exclusions, visit)
 	}
-
-	return inventoryObjects(ctx, client, bucket, prefix, exclusions, onPage)
+	return walkObjects(ctx, client, bucket, prefix, exclusions, visit)
 }
 
 // IsExcluded reports whether key matches an exact-key or subtree protection rule.
@@ -171,20 +189,22 @@ func discoverUnversionedPrefixes(ctx context.Context, client ObjectLister, bucke
 	}
 }
 
-func inventoryVersions(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string, onPage func(InventoryProgress)) (Inventory, error) {
-	inventory := Inventory{}
-	pages := 0
+func walkVersions(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string, visit func(Inventory) error) error {
 	var keyMarker, versionMarker *string
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		inventory := Inventory{}
 		result, err := client.ListObjectVersions(ctx, &s3.ListObjectVersionsInput{Bucket: aws.String(bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl, KeyMarker: keyMarker, VersionIdMarker: versionMarker})
 		if err != nil {
-			return Inventory{}, fmt.Errorf("list versions below %q: %w", prefix, err)
+			return fmt.Errorf("list versions below %q: %w", prefix, err)
 		}
 		if result == nil {
-			return Inventory{}, fmt.Errorf("list versions below %q: empty response", prefix)
+			return fmt.Errorf("list versions below %q: empty response", prefix)
 		}
 		if err := decodeListObjectVersions(result); err != nil {
-			return Inventory{}, fmt.Errorf("list versions below %q: decode URL-encoded keys: %w", prefix, err)
+			return fmt.Errorf("list versions below %q: decode URL-encoded keys: %w", prefix, err)
 		}
 		for _, object := range result.Versions {
 			key := aws.ToString(object.Key)
@@ -198,34 +218,35 @@ func inventoryVersions(ctx context.Context, client ObjectLister, bucket, prefix 
 				addEntry(&inventory, ObjectEntry{Key: key, VersionID: aws.ToString(marker.VersionId), DeleteMarker: true})
 			}
 		}
-		pages++
-		if onPage != nil {
-			onPage(InventoryProgress{Pages: pages, Objects: len(inventory.Entries), Bytes: inventory.Bytes})
+		if err := visit(inventory); err != nil {
+			return err
 		}
 		if !aws.ToBool(result.IsTruncated) {
-			return inventory, nil
+			return nil
 		}
 		if result.NextKeyMarker == nil || result.NextVersionIdMarker == nil {
-			return Inventory{}, fmt.Errorf("list versions below %q: truncated response has no markers", prefix)
+			return fmt.Errorf("list versions below %q: truncated response has no markers", prefix)
 		}
 		keyMarker, versionMarker = result.NextKeyMarker, result.NextVersionIdMarker
 	}
 }
 
-func inventoryObjects(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string, onPage func(InventoryProgress)) (Inventory, error) {
-	inventory := Inventory{}
-	pages := 0
+func walkObjects(ctx context.Context, client ObjectLister, bucket, prefix string, exclusions []string, visit func(Inventory) error) error {
 	var continuationToken *string
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		inventory := Inventory{}
 		result, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(bucket), Prefix: aws.String(prefix), EncodingType: types.EncodingTypeUrl, ContinuationToken: continuationToken})
 		if err != nil {
-			return Inventory{}, fmt.Errorf("list objects below %q: %w", prefix, err)
+			return fmt.Errorf("list objects below %q: %w", prefix, err)
 		}
 		if result == nil {
-			return Inventory{}, fmt.Errorf("list objects below %q: empty response", prefix)
+			return fmt.Errorf("list objects below %q: empty response", prefix)
 		}
 		if err := decodeListObjectsV2(result); err != nil {
-			return Inventory{}, fmt.Errorf("list objects below %q: decode URL-encoded keys: %w", prefix, err)
+			return fmt.Errorf("list objects below %q: decode URL-encoded keys: %w", prefix, err)
 		}
 		for _, object := range result.Contents {
 			key := aws.ToString(object.Key)
@@ -233,15 +254,14 @@ func inventoryObjects(ctx context.Context, client ObjectLister, bucket, prefix s
 				addEntry(&inventory, ObjectEntry{Key: key, Size: aws.ToInt64(object.Size)})
 			}
 		}
-		pages++
-		if onPage != nil {
-			onPage(InventoryProgress{Pages: pages, Objects: len(inventory.Entries), Bytes: inventory.Bytes})
+		if err := visit(inventory); err != nil {
+			return err
 		}
 		if !aws.ToBool(result.IsTruncated) {
-			return inventory, nil
+			return nil
 		}
 		if result.NextContinuationToken == nil {
-			return Inventory{}, fmt.Errorf("list objects below %q: truncated response has no continuation token", prefix)
+			return fmt.Errorf("list objects below %q: truncated response has no continuation token", prefix)
 		}
 		continuationToken = result.NextContinuationToken
 	}

@@ -41,6 +41,9 @@ func runWithOutput(ctx context.Context, args []string, interactiveTerminal, outp
 	}
 	if len(request.Prefixes) == 0 && request.ConfirmedBucket == "" {
 		if !interactiveTerminal {
+			if request.DryRun {
+				return errors.New("non-interactive dry run requires --prefix")
+			}
 			return errors.New("non-interactive execution requires --prefix and --confirm-bucket")
 		}
 		status := NewProgressRenderer(output, outputTerminal)
@@ -52,7 +55,7 @@ func runWithOutput(ctx context.Context, args []string, interactiveTerminal, outp
 			status.SetPhase("operation stopped")
 			return err
 		}
-		return runInteractive(ctx, os.Stdin, output, config, client, request.BucketStats, request.BucketStatsOptions, status)
+		return runInteractive(ctx, os.Stdin, output, config, client, request.BucketStats, request.BucketStatsOptions, request.DryRun, status)
 	}
 	if err := validateBatchRequestHeader(request, config.Bucket); err != nil {
 		return err
@@ -92,6 +95,9 @@ func runWithOutput(ctx context.Context, args []string, interactiveTerminal, outp
 	}
 	stats := bucketStatsBaseline(ctx, client, config.Bucket, versioning, request.BucketStats, request.BucketStatsOptions, progress)
 	progress.SetBucketStats(stats)
+	if request.DryRun {
+		return dryRunSelectedPrefixes(ctx, client, config.Bucket, request.Prefixes, versioning, config.Exclude, output, progress)
+	}
 	if _, err := DeleteSelectedPrefixes(ctx, client, config.Bucket, request.Prefixes, versioning, config.Exclude, progress); err != nil {
 		progress.SetPhase("deletion stopped")
 		return fmt.Errorf("delete selected prefixes: %w", err)
@@ -117,10 +123,10 @@ func validateBatchRequestHeader(request BatchRequest, bucket string) error {
 	if len(request.Prefixes) == 0 {
 		return errors.New("non-interactive mode requires at least one --prefix")
 	}
-	if request.ConfirmedBucket == "" {
+	if request.ConfirmedBucket == "" && !request.DryRun {
 		return errors.New("non-interactive mode requires --confirm-bucket")
 	}
-	if request.ConfirmedBucket != bucket {
+	if request.ConfirmedBucket != "" && request.ConfirmedBucket != bucket {
 		return fmt.Errorf("--confirm-bucket %q does not exactly match configured bucket %q", request.ConfirmedBucket, bucket)
 	}
 	return nil

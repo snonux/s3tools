@@ -12,6 +12,7 @@ import (
 type BatchRequest struct {
 	Prefixes           []string
 	ConfirmedBucket    string
+	DryRun             bool
 	BucketStats        bool
 	BucketStatsOptions BucketStatsOptions
 }
@@ -41,6 +42,10 @@ func ParseBatchArgs(args []string) (BatchRequest, []string, error) {
 			}
 			request.ConfirmedBucket = value
 			index = nextIndex
+			continue
+		}
+		if argument == "--dry-run" || argument == "-dry-run" {
+			request.DryRun = true
 			continue
 		}
 		if argument == "--bucket-stats" {
@@ -84,14 +89,8 @@ func ParseBatchArgs(args []string) (BatchRequest, []string, error) {
 
 // ValidateBatchRequest verifies explicit targets before deletion begins.
 func ValidateBatchRequest(request BatchRequest, bucket string, available []string, exclusions []string) error {
-	if len(request.Prefixes) == 0 {
-		return errors.New("non-interactive mode requires at least one --prefix")
-	}
-	if request.ConfirmedBucket == "" {
-		return errors.New("non-interactive mode requires --confirm-bucket")
-	}
-	if request.ConfirmedBucket != bucket {
-		return fmt.Errorf("--confirm-bucket %q does not exactly match configured bucket %q", request.ConfirmedBucket, bucket)
+	if err := validateBatchRequestHeader(request, bucket); err != nil {
+		return err
 	}
 
 	if err := validateBatchTargets(request.Prefixes, exclusions); err != nil {

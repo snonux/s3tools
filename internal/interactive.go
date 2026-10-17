@@ -59,7 +59,7 @@ func ConfirmBucket(text, bucket string) error {
 	return nil
 }
 
-func runInteractive(ctx context.Context, input io.Reader, output io.Writer, config Config, client S3API, bucketStats bool, bucketStatsOptions BucketStatsOptions, status *ProgressRenderer) error {
+func runInteractive(ctx context.Context, input io.Reader, output io.Writer, config Config, client S3API, bucketStats bool, bucketStatsOptions BucketStatsOptions, dryRun bool, status *ProgressRenderer) error {
 	status.SetPhase("checking bucket versioning")
 	versioning, err := DetectVersioning(ctx, client, config.Bucket)
 	if err != nil {
@@ -83,13 +83,20 @@ func runInteractive(ctx context.Context, input io.Reader, output io.Writer, conf
 	}
 	status.Finish()
 	reader := bufio.NewReader(input)
+	if dryRun {
+		if _, err := fmt.Fprintln(output, "Dry run: preview only; nothing will be deleted."); err != nil {
+			return fmt.Errorf("print dry-run notice: %w", err)
+		}
+	}
 	selected, err := selectPrefixesWithStats(reader, output, prefixChoices(prefixes, config.Exclude), scan)
 	if err != nil {
 		return err
 	}
 	reportBucketStats(output, scan)
-	if err := confirmBucket(reader, output, config.Bucket, selected); err != nil {
-		return err
+	if !dryRun {
+		if err := confirmBucket(reader, output, config.Bucket, selected); err != nil {
+			return err
+		}
 	}
 	var stats *BucketStats
 	if scan != nil {
@@ -102,9 +109,16 @@ func runInteractive(ctx context.Context, input io.Reader, output io.Writer, conf
 		reportBucketStats(output, scan)
 	}
 	progress := NewProgressRendererWithBucketStats(output, true, stats)
-	progress.SetPhase("preparing selected deletion")
+	if dryRun {
+		progress.SetPhase("preparing dry run")
+	} else {
+		progress.SetPhase("preparing selected deletion")
+	}
 	progress.Begin(ctx)
 	defer progress.Finish()
+	if dryRun {
+		return dryRunSelectedPrefixes(ctx, client, config.Bucket, selected, versioning, config.Exclude, output, progress)
+	}
 	if _, err := DeleteSelectedPrefixes(ctx, client, config.Bucket, selected, versioning, config.Exclude, progress); err != nil {
 		progress.SetPhase("deletion stopped")
 		return fmt.Errorf("delete selected prefixes: %w", err)

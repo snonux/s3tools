@@ -87,6 +87,30 @@ s3rm -exclude keep/ -exclude legal/hold.txt \
   --prefix=2024-archive/ --confirm-bucket=photos
 ```
 
+## Dry run
+
+Use `--dry-run` to preview a deletion using only read requests:
+
+```sh
+s3rm --dry-run --prefix=2024-archive/ --prefix=exports/
+```
+
+In a terminal, `s3rm --dry-run` opens the usual prefix selector. Dry runs do
+not require bucket confirmation. If `--confirm-bucket` is supplied, it must
+still match the configured bucket exactly. Non-interactive dry runs require
+at least one explicit `--prefix`.
+
+The report shows eligible object counts and bytes per prefix and in total.
+For versioned or suspended buckets it counts all eligible object versions
+and reports delete markers separately. Protected keys are excluded from
+the totals, and the report lists the configured exclusion rules. No objects,
+versions, or delete markers are deleted.
+
+The scan processes one listing page at a time and reports progress while it
+runs. An incomplete or failed scan returns an error instead of a completed
+report. Results reflect listing time; concurrent changes can affect a later
+deletion. `--bucket-stats` and its scan limits also work with dry runs.
+
 ## Progress and bucket statistics
 
 `s3rm` reports its current phase immediately and refreshes status every two
